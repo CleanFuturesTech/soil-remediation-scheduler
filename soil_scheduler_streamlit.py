@@ -3,7 +3,7 @@ Soil Remediation Scheduler - Streamlit Interactive App
 Interactive web app for multi-phase soil remediation with capacity pooling
 """
 
-APP_VERSION = "2.03"
+APP_VERSION = "2.04"
 
 import streamlit as st
 import pandas as pd
@@ -570,31 +570,28 @@ def calculate_costs(activities, schedule, params, cost_params, phases_df):
                  charged for every day of project duration
     - Water purchase: BBL/day × $/BBL, where daily BBL is driven by cells in Treat today
     - Water trucking: truck-hours × $/hr, based on BBLs hauled
-    - Leachate disposal: $/BBL × daily BBL, where daily BBL = pct × water_(today - lag_days)
+    - Leachate disposal: $/BBL × daily BBL, distributed evenly across each flip's Dry days
     - Leachate trucking: truck-hours × $/hr, based on BBLs hauled
-    - Amendments: $/CY, charged on first Treat day per flip (lump per flip)
+    - Amendments: $/CY total per flip, distributed evenly across each flip's Treat days
     
-    Water/leachate model mirrors the spreadsheet:
+    Per-day volume model:
       water_BBL_today = water_BBL_per_CY × cell_size × N_cells_in_Treat / treat_duration
-      leachate_BBL_today = leachate_pct × water_BBL_(today - lag_days)
+      leachate_BBL_today = (water_BBL × leachate_pct × treat_duration / dry_duration) × N_cells_in_Dry
+      amendment_$_today = (amendment_$_per_CY × cell_size / treat_duration) × N_cells_in_Treat
     
     Returns:
         daily_costs_df: per-day cost breakdown
         summary: dict of total costs by category
     """
-    # ---------- Per-flip soil volumes & treat schedules ----------
+    # ---------- Per-flip soil volumes ----------
     flip_cy = {}            # flip_num -> total CY loaded
-    flip_first_treat = {}   # flip_num -> first Treat date (for amendments)
     
     for act in activities:
         fn = act['FlipNum']
         if 'Load' in act['Phase']:
             flip_cy[fn] = flip_cy.get(fn, 0) + act['SoilIn']
-        elif act['Phase'] == 'Treat':
-            if fn not in flip_first_treat:
-                flip_first_treat[fn] = act['Date']
     
-    # ---------- Treat duration (days) ----------
+    # ---------- Treat and Dry duration (days) ----------
     try:
         treat_duration_days = int(phases_df[phases_df['Phase'] == 'Treat']['Duration_Days'].iloc[0])
     except Exception:
@@ -602,7 +599,14 @@ def calculate_costs(activities, schedule, params, cost_params, phases_df):
     if treat_duration_days <= 0:
         treat_duration_days = 1
     
-    # ---------- Cell-size for daily water calc ----------
+    try:
+        dry_duration_days = int(phases_df[phases_df['Phase'] == 'Dry']['Duration_Days'].iloc[0])
+    except Exception:
+        dry_duration_days = 5
+    if dry_duration_days <= 0:
+        dry_duration_days = 1
+    
+    # ---------- Cell-size ----------
     cell_size_cy = params.get('CellSize_CY', 0)
     
     # ---------- Initialize daily cost dataframe ----------
@@ -614,6 +618,7 @@ def calculate_costs(activities, schedule, params, cost_params, phases_df):
         'SkidsteerCost': 0.0,
         'EquipmentCost': 0.0,
         'CellsInTreat': 0,
+        'CellsInDry': 0,
         'WaterBBL': 0.0,
         'WaterPurchaseCost': 0.0,
         'WaterTruckingCost': 0.0,
@@ -640,7 +645,7 @@ def calculate_costs(activities, schedule, params, cost_params, phases_df):
         daily_costs.at[date, 'SkidsteerCost'] = daily_skidsteer
         daily_costs.at[date, 'EquipmentCost'] = daily_fleet_cost
     
-    # ---------- Water (per-day from cells in Treat) ----------
+    # ---------- Rate constants ----------
     water_bbl_per_cy   = cost_params.get('water_bbl_per_cy', 0.0)
     water_cost_per_bbl = cost_params.get('water_cost_per_bbl', 0.0)
     water_truck_cap    = cost_params.get('water_truck_capacity', 120)
@@ -648,76 +653,61 @@ def calculate_costs(activities, schedule, params, cost_params, phases_df):
     water_truck_rate   = cost_params.get('water_truck_hourly', 95.0)
     water_truck_cost_per_bbl = (water_trip_hr * water_truck_rate / water_truck_cap) if water_truck_cap > 0 else 0.0
     
-    # BBL per cell-day in Treat = total_water_per_CY × cell_size / treat_duration_days
-    water_bbl_per_treat_cell_day = (water_bbl_per_cy * cell_size_cy / treat_duration_days) if treat_duration_days > 0 else 0.0
+    leachate_pct          = cost_params.get('leachate_pct_of_water', 80) / 100.0
+    leachate_cost_per_bbl = cost_params.get('leachate_cost_per_bbl', 0.0)
+    leachate_truck_cap    = cost_params.get('leachate_truck_capacity', 120)
+    leachate_trip_hr      = cost_params.get('leachate_truck_trip_hr', 1.0)
+    leachate_truck_rate   = cost_params.get('leachate_truck_hourly', 95.0)
+    leachate_truck_cost_per_bbl = (leachate_trip_hr * leachate_truck_rate / leachate_truck_cap) if leachate_truck_cap > 0 else 0.0
+    if cost_params.get('onsite_evap_pond', False):
+        leachate_truck_cost_per_bbl = 0.0  # Pumped to onsite pond — no trucking
     
-    # Count cells in Treat each day from the schedule
+    amendment_cost_per_cy = cost_params.get('amendment_cost_per_cy', 0.0)
+    
+    # ---------- Per-cell-day rates ----------
+    # Water: total water per CY × cell_size, spread across treat_duration days
+    water_bbl_per_treat_cell_day = (water_bbl_per_cy * cell_size_cy / treat_duration_days) if treat_duration_days > 0 else 0.0
+    # Leachate: total water per cell × leachate_pct, spread across dry_duration days
+    leachate_bbl_per_dry_cell_day = (water_bbl_per_cy * cell_size_cy * leachate_pct / dry_duration_days) if dry_duration_days > 0 else 0.0
+    # Amendments: total amendment cost per cell, spread across treat_duration days
+    amendment_per_treat_cell_day = (amendment_cost_per_cy * cell_size_cy / treat_duration_days) if treat_duration_days > 0 else 0.0
+    
+    # ---------- Walk the schedule once, counting cells in Treat and Dry each day ----------
     num_cells = int(params['NumCells'])
     cell_cols = [f'Cell{i}Phase' for i in range(1, num_cells + 1)]
-    
-    # Build a list of (date, n_treat) so we can apply leachate lag by index
-    schedule_dates = list(schedule['Date'].values)
-    n_treat_by_date_idx = []
     
     for idx, row in schedule.iterrows():
         date = row['Date']
         if date not in daily_costs.index:
-            n_treat_by_date_idx.append(0)
             continue
         
         n_treat = 0
+        n_dry   = 0
         for col in cell_cols:
             phase_str = str(row[col]) if pd.notna(row[col]) else ''
             if 'Treat' in phase_str:
                 n_treat += 1
+            if 'Dry' in phase_str:
+                n_dry += 1
         
-        n_treat_by_date_idx.append(n_treat)
-        
+        # Water (driven by cells in Treat)
         water_bbl = n_treat * water_bbl_per_treat_cell_day
         daily_costs.at[date, 'CellsInTreat'] = n_treat
         daily_costs.at[date, 'WaterBBL'] = water_bbl
         daily_costs.at[date, 'WaterPurchaseCost'] = water_bbl * water_cost_per_bbl
         daily_costs.at[date, 'WaterTruckingCost'] = water_bbl * water_truck_cost_per_bbl
         daily_costs.at[date, 'WaterCost'] = daily_costs.at[date, 'WaterPurchaseCost'] + daily_costs.at[date, 'WaterTruckingCost']
-    
-    # ---------- Leachate (3-day lag from water by default) ----------
-    leachate_pct       = cost_params.get('leachate_pct_of_water', 80) / 100.0
-    leachate_lag       = int(cost_params.get('leachate_lag_days', 3))
-    leachate_cost_per_bbl = cost_params.get('leachate_cost_per_bbl', 0.0)
-    leachate_truck_cap = cost_params.get('leachate_truck_capacity', 120)
-    leachate_trip_hr   = cost_params.get('leachate_truck_trip_hr', 1.0)
-    leachate_truck_rate = cost_params.get('leachate_truck_hourly', 95.0)
-    leachate_truck_cost_per_bbl = (leachate_trip_hr * leachate_truck_rate / leachate_truck_cap) if leachate_truck_cap > 0 else 0.0
-    if cost_params.get('onsite_evap_pond', False):
-        leachate_truck_cost_per_bbl = 0.0  # Pumped to onsite pond — no trucking
-    
-    n_dates = len(schedule_dates)
-    for src_idx in range(n_dates):
-        water_bbl_that_day = n_treat_by_date_idx[src_idx] * water_bbl_per_treat_cell_day
-        if water_bbl_that_day <= 0:
-            continue
         
-        # Target day for leachate
-        tgt_idx = min(src_idx + leachate_lag, n_dates - 1)  # clamp to last day if lag exceeds buffer
-        tgt_date = schedule_dates[tgt_idx]
-        if tgt_date not in daily_costs.index:
-            continue
+        # Leachate (driven by cells in Dry — spread evenly across each flip's dry days)
+        leachate_bbl = n_dry * leachate_bbl_per_dry_cell_day
+        daily_costs.at[date, 'CellsInDry'] = n_dry
+        daily_costs.at[date, 'LeachateBBL'] = leachate_bbl
+        daily_costs.at[date, 'LeachateDisposalCost'] = leachate_bbl * leachate_cost_per_bbl
+        daily_costs.at[date, 'LeachateTruckingCost'] = leachate_bbl * leachate_truck_cost_per_bbl
+        daily_costs.at[date, 'LeachateCost'] = daily_costs.at[date, 'LeachateDisposalCost'] + daily_costs.at[date, 'LeachateTruckingCost']
         
-        leachate_bbl = water_bbl_that_day * leachate_pct
-        daily_costs.at[tgt_date, 'LeachateBBL'] += leachate_bbl
-        daily_costs.at[tgt_date, 'LeachateDisposalCost'] += leachate_bbl * leachate_cost_per_bbl
-        daily_costs.at[tgt_date, 'LeachateTruckingCost'] += leachate_bbl * leachate_truck_cost_per_bbl
-    
-    daily_costs['LeachateCost'] = daily_costs['LeachateDisposalCost'] + daily_costs['LeachateTruckingCost']
-    
-    # ---------- Amendments (lump sum on first Treat day per flip) ----------
-    amendment_cost_per_cy = cost_params.get('amendment_cost_per_cy', 0.0)
-    
-    for fn, cy in flip_cy.items():
-        if fn in flip_first_treat:
-            first_date = flip_first_treat[fn]
-            if first_date in daily_costs.index:
-                daily_costs.at[first_date, 'AmendmentCost'] += cy * amendment_cost_per_cy
+        # Amendments (driven by cells in Treat — spread evenly across each flip's treat days)
+        daily_costs.at[date, 'AmendmentCost'] = n_treat * amendment_per_treat_cell_day
     
     # ---------- Totals & cumulative ----------
     daily_costs['TotalCost'] = (
@@ -767,6 +757,400 @@ def calculate_costs(activities, schedule, params, cost_params, phases_df):
     summary['PeakCellsInTreat']    = int(daily_costs['CellsInTreat'].max())
     
     return daily_costs, summary
+
+
+# ============================================================================
+# Formula-driven Excel export
+# ============================================================================
+
+def build_formula_excel(schedule_for_export, activities_df, params, cost_params,
+                       cost_summary, completion_date, total_days,
+                       filtered_idle_days, total_flips, phases_df):
+    """
+    Build the Excel workbook with formula-driven calculations.
+    
+    Sheets produced:
+      - Inputs: editable rate constants (source of truth)
+      - Schedule: daily schedule; cost/volume columns are formulas referencing Inputs
+      - Cell_Activities: raw activity log (no formulas)
+      - Summary: aggregated totals using SUM() formulas referencing Schedule
+    
+    Returns:
+      BytesIO of the Excel file
+    """
+    # ---------- Phase durations from phases_df ----------
+    def _phase_dur(name, default):
+        try:
+            v = int(phases_df[phases_df['Phase'] == name]['Duration_Days'].iloc[0])
+            return v if v > 0 else default
+        except Exception:
+            return default
+    treat_dur = _phase_dur('Treat', 3)
+    dry_dur   = _phase_dur('Dry', 5)
+    
+    output = BytesIO()
+    
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        workbook = writer.book
+        
+        # ============================================================
+        # 1. INPUTS sheet — editable rate constants
+        # ============================================================
+        inputs_rows = []   # list of (label, value_or_formula, note)
+        INPUTS = {}        # logical name -> 'Inputs!$B$N'
+        
+        def add_input(name, label, value, note=''):
+            inputs_rows.append((label, value, note))
+            INPUTS[name] = f'Inputs!$B${len(inputs_rows) + 1}'
+        
+        def add_section(title):
+            inputs_rows.append((title, '', ''))
+        
+        add_section('PROJECT')
+        add_input('total_soil',  'Total Soil (CY)',         int(params['TotalSoil_CY']))
+        add_input('cell_size',   'Cell Size (CY)',          int(params['CellSize_CY']))
+        add_input('num_cells',   'Number of Cells',         int(params['NumCells']))
+        add_input('treat_days',  'Treat Duration (days)',   treat_dur)
+        add_input('dry_days',    'Dry Duration (days)',     dry_dur)
+        
+        add_section('')
+        add_section('WATER')
+        add_input('water_bbl_per_cy',  'Water usage (BBL/CY)',           cost_params.get('water_bbl_per_cy', 0))
+        add_input('water_cost',        'Water cost ($/BBL)',             cost_params.get('water_cost_per_bbl', 0), 'Set to 0 if onsite well')
+        add_input('water_truck_cap',   'Water truck capacity (BBL)',     cost_params.get('water_truck_capacity', 0))
+        add_input('water_trip_hr',     'Water truck trip time (hr)',     cost_params.get('water_truck_trip_hr', 0))
+        add_input('water_truck_hourly','Water truck $/hr',               cost_params.get('water_truck_hourly', 0))
+        add_input('water_truck_per_bbl','Water trucking ($/BBL) [derived]',
+                  f"={INPUTS['water_trip_hr']}*{INPUTS['water_truck_hourly']}/{INPUTS['water_truck_cap']}")
+        add_input('water_per_cell_day','Water BBL per cell-day Treat [derived]',
+                  f"={INPUTS['water_bbl_per_cy']}*{INPUTS['cell_size']}/{INPUTS['treat_days']}")
+        
+        add_section('')
+        add_section('LEACHATE')
+        add_input('leach_pct',         'Leachate % of water',            cost_params.get('leachate_pct_of_water', 0) / 100.0)
+        add_input('leach_cost',        'Leachate disposal ($/BBL)',      cost_params.get('leachate_cost_per_bbl', 0), 'Set to 0 if onsite evap pond')
+        add_input('leach_truck_cap',   'Leachate truck capacity (BBL)',  cost_params.get('leachate_truck_capacity', 0))
+        add_input('leach_trip_hr',     'Leachate truck trip time (hr)',  cost_params.get('leachate_truck_trip_hr', 0))
+        add_input('leach_truck_hourly','Leachate truck $/hr',            cost_params.get('leachate_truck_hourly', 0))
+        # If onsite evap pond, force leachate trucking to 0
+        if cost_params.get('onsite_evap_pond', False):
+            add_input('leach_truck_per_bbl','Leachate trucking ($/BBL) [derived]', 0, 'Zeroed: onsite evap pond')
+        else:
+            add_input('leach_truck_per_bbl','Leachate trucking ($/BBL) [derived]',
+                      f"={INPUTS['leach_trip_hr']}*{INPUTS['leach_truck_hourly']}/{INPUTS['leach_truck_cap']}")
+        add_input('leach_per_cell_day','Leachate BBL per cell-day Dry [derived]',
+                  f"={INPUTS['water_bbl_per_cy']}*{INPUTS['cell_size']}*{INPUTS['leach_pct']}/{INPUTS['dry_days']}")
+        
+        add_section('')
+        add_section('AMENDMENTS')
+        add_input('amend_cost',        'Amendment cost ($/CY)',          cost_params.get('amendment_cost_per_cy', 0))
+        add_input('amend_per_cell_day','Amendment $ per cell-day Treat [derived]',
+                  f"={INPUTS['amend_cost']}*{INPUTS['cell_size']}/{INPUTS['treat_days']}")
+        
+        add_section('')
+        add_section('EQUIPMENT')
+        add_input('n_excavator', '# Excavators',       cost_params.get('n_excavator', 0))
+        add_input('exc_daily',   'Excavator $/day',    cost_params.get('excavator_daily', 0))
+        add_input('n_loader',    '# Loaders',          cost_params.get('n_loader', 0))
+        add_input('load_daily',  'Loader $/day',       cost_params.get('loader_daily', 0))
+        add_input('n_bulldozer', '# Bulldozers',       cost_params.get('n_bulldozer', 0))
+        add_input('bull_daily',  'Bulldozer $/day',    cost_params.get('bulldozer_daily', 0))
+        add_input('n_skidsteer', '# Skidsteers',       cost_params.get('n_skidsteer', 0))
+        add_input('skid_daily',  'Skidsteer $/day',    cost_params.get('skidsteer_daily', 0))
+        add_input('daily_equip_total', 'Daily fleet cost ($) [derived]',
+                  f"={INPUTS['n_excavator']}*{INPUTS['exc_daily']}+{INPUTS['n_loader']}*{INPUTS['load_daily']}+{INPUTS['n_bulldozer']}*{INPUTS['bull_daily']}+{INPUTS['n_skidsteer']}*{INPUTS['skid_daily']}")
+        
+        # Create the Inputs sheet at position 0 (first tab)
+        inputs_ws = workbook.create_sheet('Inputs', 0)
+        # Remove any default empty sheet that openpyxl created
+        for sheet_name in list(workbook.sheetnames):
+            if sheet_name == 'Sheet':
+                del workbook[sheet_name]
+        
+        inputs_ws['A1'] = 'Parameter'
+        inputs_ws['B1'] = 'Value'
+        inputs_ws['C1'] = 'Notes'
+        inputs_ws['A1'].font = Font(name='Aptos Narrow', size=10, bold=True)
+        inputs_ws['B1'].font = Font(name='Aptos Narrow', size=10, bold=True)
+        inputs_ws['C1'].font = Font(name='Aptos Narrow', size=10, bold=True)
+        
+        section_fill = PatternFill(start_color='FFE7E6E6', end_color='FFE7E6E6', fill_type='solid')
+        for i, (label, val, note) in enumerate(inputs_rows, start=2):
+            a_cell = inputs_ws.cell(row=i, column=1, value=label)
+            b_cell = inputs_ws.cell(row=i, column=2, value=val)
+            c_cell = inputs_ws.cell(row=i, column=3, value=note)
+            a_cell.font = Font(name='Aptos Narrow', size=10)
+            b_cell.font = Font(name='Aptos Narrow', size=10)
+            c_cell.font = Font(name='Aptos Narrow', size=10, italic=True)
+            if label in ('PROJECT', 'WATER', 'LEACHATE', 'AMENDMENTS', 'EQUIPMENT') or label == '':
+                a_cell.fill = section_fill
+                b_cell.fill = section_fill
+                c_cell.fill = section_fill
+                a_cell.font = Font(name='Aptos Narrow', size=10, bold=True)
+        
+        inputs_ws.column_dimensions['A'].width = 42
+        inputs_ws.column_dimensions['B'].width = 14
+        inputs_ws.column_dimensions['C'].width = 32
+        
+        # ============================================================
+        # 2. SCHEDULE sheet — data first, then overwrite with formulas
+        # ============================================================
+        schedule_for_export.to_excel(writer, sheet_name='Schedule', index=False)
+        sched_ws = writer.sheets['Schedule']
+        
+        # Column letter map
+        sched_cols = {col: get_column_letter(i + 1)
+                      for i, col in enumerate(schedule_for_export.columns)}
+        
+        cell_phase_columns = [c for c in schedule_for_export.columns if 'Phase' in c]
+        if cell_phase_columns:
+            first_phase_col = sched_cols[cell_phase_columns[0]]
+            last_phase_col  = sched_cols[cell_phase_columns[-1]]
+        else:
+            first_phase_col = last_phase_col = 'A'
+        
+        n_rows = len(schedule_for_export)
+        for row in range(2, n_rows + 2):
+            phase_range = f"${first_phase_col}{row}:${last_phase_col}{row}"
+            
+            def set_formula(col_name, formula):
+                if col_name in sched_cols:
+                    sched_ws[f"{sched_cols[col_name]}{row}"] = formula
+            
+            # Volume formulas
+            set_formula('WaterIn_BBL',
+                        f'=COUNTIF({phase_range},"*Treat*")*{INPUTS["water_per_cell_day"]}')
+            set_formula('LeachateOut_BBL',
+                        f'=COUNTIF({phase_range},"*Dry*")*{INPUTS["leach_per_cell_day"]}')
+            
+            # Cumulative volumes
+            if 'WaterIn_BBL' in sched_cols:
+                wcol = sched_cols['WaterIn_BBL']
+                set_formula('CumWaterIn_BBL', f'=SUM(${wcol}$2:{wcol}{row})')
+            if 'LeachateOut_BBL' in sched_cols:
+                lcol = sched_cols['LeachateOut_BBL']
+                set_formula('CumLeachateOut_BBL', f'=SUM(${lcol}$2:{lcol}{row})')
+            
+            # Cumulative soil
+            if 'SoilIn' in sched_cols:
+                si = sched_cols['SoilIn']
+                set_formula('CumSoilIn', f'=SUM(${si}$2:{si}{row})')
+            if 'SoilOut' in sched_cols:
+                so = sched_cols['SoilOut']
+                set_formula('CumSoilOut', f'=SUM(${so}$2:{so}{row})')
+            
+            # Cost formulas (referenced from volume cells × rates from Inputs)
+            if 'WaterIn_BBL' in sched_cols:
+                wb_cell = f'{sched_cols["WaterIn_BBL"]}{row}'
+                set_formula('WaterCost_$',     f'={wb_cell}*{INPUTS["water_cost"]}')
+                set_formula('WaterTrucking_$', f'={wb_cell}*{INPUTS["water_truck_per_bbl"]}')
+            if 'LeachateOut_BBL' in sched_cols:
+                lb_cell = f'{sched_cols["LeachateOut_BBL"]}{row}'
+                set_formula('LeachateDisposal_$', f'={lb_cell}*{INPUTS["leach_cost"]}')
+                set_formula('LeachateTrucking_$', f'={lb_cell}*{INPUTS["leach_truck_per_bbl"]}')
+            set_formula('Amendments_$',
+                        f'=COUNTIF({phase_range},"*Treat*")*{INPUTS["amend_per_cell_day"]}')
+        
+        # ============================================================
+        # 3. CELL ACTIVITIES sheet — raw, no formulas
+        # ============================================================
+        activities_df.to_excel(writer, sheet_name='Cell_Activities', index=False)
+        
+        # ============================================================
+        # 4. SUMMARY sheet — formulas referencing Schedule + Inputs
+        # ============================================================
+        summary_ws = workbook.create_sheet('Summary')
+        summary_ws['A1'] = 'Metric'
+        summary_ws['B1'] = 'Value'
+        summary_ws['A1'].font = Font(name='Aptos Narrow', size=10, bold=True)
+        summary_ws['B1'].font = Font(name='Aptos Narrow', size=10, bold=True)
+        
+        def sched_col_range(col_name):
+            if col_name not in sched_cols:
+                return None
+            c = sched_cols[col_name]
+            return f"Schedule!${c}$2:${c}${n_rows + 1}"
+        
+        # Date column reference for project-day count
+        date_col_letter = sched_cols.get('Date', 'D')
+        project_days_formula = f"COUNTA(Schedule!${date_col_letter}$2:${date_col_letter}${n_rows + 1})"
+        
+        # Define summary rows. Use list so we can compute row offsets for inter-row references.
+        sched_water_bbl_range  = sched_col_range('WaterIn_BBL')
+        sched_leach_bbl_range  = sched_col_range('LeachateOut_BBL')
+        sched_water_cost_range = sched_col_range('WaterCost_$')
+        sched_water_truck_range= sched_col_range('WaterTrucking_$')
+        sched_leach_disp_range = sched_col_range('LeachateDisposal_$')
+        sched_leach_truck_range= sched_col_range('LeachateTrucking_$')
+        sched_amend_range      = sched_col_range('Amendments_$')
+        
+        summary_rows = [
+            ('Total Soil (CY)',              f"={INPUTS['total_soil']}"),
+            ('Cell Size (CY)',               f"={INPUTS['cell_size']}"),
+            ('Number of Cells',              f"={INPUTS['num_cells']}"),
+            ('Total Flips',                  total_flips),
+            ('Daily Soil Capacity (CY)',     int(params.get('DailyLoad_CY', 0))),
+            ('Bottleneck',                   cost_params.get('bottleneck', 'N/A')),
+            ('Start Date',                   params['StartDate'].strftime('%Y-%m-%d')),
+            ('Completion Date',              completion_date.strftime('%Y-%m-%d') if completion_date else 'N/A'),
+            ('Project Days',                 f"={project_days_formula}"),
+            ('Idle Capacity Days',           len(filtered_idle_days)),
+            ('', ''),
+            ('MATERIAL VOLUMES',     ''),
+            ('Total Water Used (BBL)',       f"=SUM({sched_water_bbl_range})"  if sched_water_bbl_range  else 0),
+            ('Total Leachate Disposed (BBL)',f"=SUM({sched_leach_bbl_range})" if sched_leach_bbl_range else 0),
+            ('', ''),
+            ('COST SUMMARY',         ''),
+            ('Equipment Cost ($)',           f"={INPUTS['daily_equip_total']}*{project_days_formula}"),
+            ('Water Purchase Cost ($)',      f"=SUM({sched_water_cost_range})"  if sched_water_cost_range  else 0),
+            ('Water Trucking Cost ($)',      f"=SUM({sched_water_truck_range})" if sched_water_truck_range else 0),
+            ('Water — Total ($)',            None),   # filled below
+            ('Leachate Disposal Cost ($)',   f"=SUM({sched_leach_disp_range})"  if sched_leach_disp_range  else 0),
+            ('Leachate Trucking Cost ($)',   f"=SUM({sched_leach_truck_range})" if sched_leach_truck_range else 0),
+            ('Leachate — Total ($)',         None),   # filled below
+            ('Amendment Cost ($)',           f"=SUM({sched_amend_range})" if sched_amend_range else 0),
+            ('TOTAL PROJECT COST ($)',       None),   # filled below
+            ('Cost per CY ($/CY)',           None),   # filled below
+            ('', ''),
+            ('EQUIPMENT BY TYPE',    ''),
+            ('Excavator ($)',                f"={INPUTS['n_excavator']}*{INPUTS['exc_daily']}*{project_days_formula}"),
+            ('Loader ($)',                   f"={INPUTS['n_loader']}*{INPUTS['load_daily']}*{project_days_formula}"),
+            ('Bulldozer ($)',                f"={INPUTS['n_bulldozer']}*{INPUTS['bull_daily']}*{project_days_formula}"),
+            ('Skidsteer ($)',                f"={INPUTS['n_skidsteer']}*{INPUTS['skid_daily']}*{project_days_formula}"),
+        ]
+        
+        # First pass: write everything except None placeholders
+        for i, (label, val) in enumerate(summary_rows, start=2):
+            a_cell = summary_ws.cell(row=i, column=1, value=label)
+            a_cell.font = Font(name='Aptos Narrow', size=10, bold=label in ('MATERIAL VOLUMES', 'COST SUMMARY', 'EQUIPMENT BY TYPE', 'TOTAL PROJECT COST ($)'))
+            if val is not None:
+                b_cell = summary_ws.cell(row=i, column=2, value=val)
+                b_cell.font = Font(name='Aptos Narrow', size=10)
+                # Number format for currency
+                if '($)' in label or '$/' in label:
+                    b_cell.number_format = '"$"#,##0.00'
+                elif '(CY)' in label or '(BBL)' in label or 'Days' in label or 'Cells' in label or 'Flips' in label:
+                    b_cell.number_format = '#,##0'
+        
+        # Second pass: fix up rows that reference other summary cells
+        label_to_row = {label: i + 2 for i, (label, _) in enumerate(summary_rows)}
+        
+        def set_summary(label, formula, fmt='"$"#,##0.00'):
+            r = label_to_row[label]
+            cell = summary_ws.cell(row=r, column=2, value=formula)
+            cell.font = Font(name='Aptos Narrow', size=10, bold=(label == 'TOTAL PROJECT COST ($)'))
+            cell.number_format = fmt
+        
+        set_summary('Water — Total ($)',
+                    f"=B{label_to_row['Water Purchase Cost ($)']}+B{label_to_row['Water Trucking Cost ($)']}")
+        set_summary('Leachate — Total ($)',
+                    f"=B{label_to_row['Leachate Disposal Cost ($)']}+B{label_to_row['Leachate Trucking Cost ($)']}")
+        set_summary('TOTAL PROJECT COST ($)',
+                    f"=B{label_to_row['Equipment Cost ($)']}+B{label_to_row['Water — Total ($)']}+B{label_to_row['Leachate — Total ($)']}+B{label_to_row['Amendment Cost ($)']}")
+        set_summary('Cost per CY ($/CY)',
+                    f"=B{label_to_row['TOTAL PROJECT COST ($)']}/B{label_to_row['Total Soil (CY)']}",
+                    fmt='"$"#,##0.00')
+        
+        summary_ws.column_dimensions['A'].width = 36
+        summary_ws.column_dimensions['B'].width = 18
+        
+        # ============================================================
+        # 5. SCHEDULE FORMATTING (colors, borders, number formats)
+        # ============================================================
+        phase_colors = {
+            'Load': '#8ED973',
+            'Rip': '#83CCEB',
+            'Treat': '#FFC000',
+            'Dry': '#F2CEEF',
+            'Unload': '#00B0F0'
+        }
+        
+        sunday_fill = PatternFill(start_color='FFFFFF00', end_color='FFFFFF00', fill_type='solid')
+        idle_fill   = PatternFill(start_color='FFFF0000', end_color='FFFF0000', fill_type='solid')
+        thin_border = Border(
+            left=Side(style='thin', color='000000'),
+            right=Side(style='thin', color='000000'),
+            top=Side(style='thin', color='000000'),
+            bottom=Side(style='thin', color='000000')
+        )
+        aptos_font      = Font(name='Aptos Narrow', size=10)
+        aptos_font_bold = Font(name='Aptos Narrow', size=10, bold=True)
+        center_aligned  = Alignment(horizontal='center', vertical='center')
+        
+        money_col_names  = {'WaterCost_$', 'WaterTrucking_$', 'LeachateDisposal_$', 'LeachateTrucking_$', 'Amendments_$'}
+        volume_col_names = {'WaterIn_BBL', 'CumWaterIn_BBL', 'LeachateOut_BBL', 'CumLeachateOut_BBL'}
+        soil_col_names   = {'SoilIn', 'SoilOut', 'CumSoilIn', 'CumSoilOut'}
+        
+        cell_columns = []
+        date_column_idx = None
+        dayname_column_idx = None
+        money_col_idxs  = set()
+        volume_col_idxs = set()
+        soil_col_idxs   = set()
+        
+        for col_idx, col_name in enumerate(schedule_for_export.columns, start=1):
+            if 'Phase' in col_name:
+                cell_columns.append((col_idx, col_name))
+            if col_name == 'Date':       date_column_idx    = col_idx
+            if col_name == 'DayName':    dayname_column_idx = col_idx
+            if col_name in money_col_names:  money_col_idxs.add(col_idx)
+            if col_name in volume_col_names: volume_col_idxs.add(col_idx)
+            if col_name in soil_col_names:   soil_col_idxs.add(col_idx)
+        
+        last_data_column_idx = len(schedule_for_export.columns)
+        
+        for row_idx in range(1, n_rows + 2):
+            is_sunday  = False
+            is_idle_day = False
+            
+            if row_idx > 1:
+                df_row_idx = schedule_for_export.index[row_idx - 2]
+                is_idle_day = df_row_idx in filtered_idle_days
+                if dayname_column_idx:
+                    day_name_cell = sched_ws.cell(row=row_idx, column=dayname_column_idx)
+                    is_sunday = str(day_name_cell.value) == 'Sunday'
+            
+            for col_idx in range(1, last_data_column_idx + 1):
+                cell = sched_ws.cell(row=row_idx, column=col_idx)
+                is_phase_column = any(col_idx == p_idx for p_idx, _ in cell_columns)
+                
+                cell.border = thin_border
+                cell.font = aptos_font_bold if row_idx == 1 else aptos_font
+                
+                if col_idx == date_column_idx and row_idx > 1:
+                    cell.number_format = 'M/D/YYYY'
+                    if is_idle_day:
+                        cell.fill = idle_fill
+                
+                if row_idx > 1:
+                    if col_idx in money_col_idxs:
+                        cell.number_format = '"$"#,##0.00'
+                    elif col_idx in volume_col_idxs:
+                        cell.number_format = '#,##0.0'
+                    elif col_idx in soil_col_idxs:
+                        cell.number_format = '#,##0'
+                
+                if is_sunday and not is_phase_column and row_idx > 1 and col_idx != date_column_idx:
+                    cell.fill = sunday_fill
+                
+                if row_idx > 1 and is_phase_column:
+                    cell.alignment = center_aligned
+                    phase_value = str(cell.value) if cell.value else ''
+                    for phase_name, color in phase_colors.items():
+                        if phase_name in phase_value:
+                            hex_color = color.lstrip('#')
+                            cell.fill = PatternFill(start_color='FF' + hex_color,
+                                                    end_color='FF' + hex_color,
+                                                    fill_type='solid')
+                            break
+        
+        # Auto-adjust schedule column widths
+        for column_cells in sched_ws.columns:
+            length = max(len(str(cell.value) if cell.value else "") for cell in column_cells)
+            sched_ws.column_dimensions[get_column_letter(column_cells[0].column)].width = min(length + 2, 50)
+    
+    output.seek(0)
+    return output
 
 
 # ============================================================================
@@ -923,8 +1307,6 @@ def main():
     with st.sidebar.expander("🛢️ Leachate Disposal", expanded=False):
         leachate_pct_of_water = st.slider("Leachate collected (% of water used)", min_value=0, max_value=100, value=80, step=5, key='leachate_pct_of_water',
                                             help="Typical: 75% – 100% of water becomes leachate")
-        leachate_lag_days = st.number_input("Leachate timing lag (days after water)", min_value=0, max_value=10, value=3, step=1, key='leachate_lag_days',
-                                              help="Days between water addition and leachate emergence. Default 3 matches percolation through treated soil.")
         leachate_bbl_per_cy = water_bbl_per_cy * (leachate_pct_of_water / 100.0)
         
         onsite_evap_pond = st.toggle("Onsite evaporation pond (disposal is free)", value=False, key='onsite_evap_pond',
@@ -936,7 +1318,7 @@ def main():
         else:
             leachate_cost_per_bbl = st.number_input("Leachate disposal ($/BBL)", min_value=0.0, max_value=20.0, value=0.25, step=0.25, format="%.2f", key='leachate_cost_per_bbl',
                                                       help="Typical: $0.25 – $5.00/BBL")
-            st.caption(f"Leachate: {leachate_bbl_per_cy:.2f} BBL/CY • Disposal: ${leachate_bbl_per_cy * leachate_cost_per_bbl:.2f}/CY • Emerges {leachate_lag_days}d after water added")
+            st.caption(f"Leachate: {leachate_bbl_per_cy:.2f} BBL/CY • Disposal: ${leachate_bbl_per_cy * leachate_cost_per_bbl:.2f}/CY • Spread evenly across each flip's Dry days")
         
         st.markdown("**Leachate Trucking**")
         leachate_truck_capacity = st.number_input("Leachate truck capacity (BBL/truck)", min_value=10, max_value=500, value=120, step=10, key='leachate_truck_capacity')
@@ -982,7 +1364,6 @@ def main():
         'leachate_pct_of_water': leachate_pct_of_water,
         'leachate_bbl_per_cy': leachate_bbl_per_cy,
         'leachate_cost_per_bbl': leachate_cost_per_bbl,
-        'leachate_lag_days': leachate_lag_days,
         'onsite_evap_pond': onsite_evap_pond,
         'leachate_truck_capacity': leachate_truck_capacity,
         'leachate_truck_trip_hr': leachate_truck_trip_hr,
@@ -1454,282 +1835,19 @@ def main():
             # used in the online display
             schedule_for_export = enrich_schedule_with_costs(schedule_for_export, daily_costs_export)
             
-            # Create Excel file with formatting
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                schedule_for_export.to_excel(writer, sheet_name='Schedule', index=False)
-                activities_df.to_excel(writer, sheet_name='Cell_Activities', index=False)
-                
-                # Costs sheet (daily breakdown)
-                if daily_costs_export is not None and not daily_costs_export.empty:
-                    costs_for_export = daily_costs_export.copy()
-                    costs_for_export.to_excel(writer, sheet_name='Daily_Costs', index=False)
-                
-                # Summary sheet
-                equip_by_type_exp = cost_summary_export.get('EquipmentByType', {})
-                summary_metrics = [
-                    'Total Soil (CY)',
-                    'Cell Size (CY)',
-                    'Number of Cells',
-                    'Total Flips',
-                    'Daily Soil Capacity (CY) [derived]',
-                    'Bottleneck',
-                    'Start Date',
-                    'Completion Date',
-                    'Total Days',
-                    'Final CumSoilOut (CY)',
-                    'Idle Capacity Days',
-                    '',
-                    '--- MATERIAL VOLUMES ---',
-                    'Total Water Used (BBL)',
-                    'Total Leachate Disposed (BBL)',
-                    'Peak Water Day (BBL)',
-                    'Peak Leachate Day (BBL)',
-                    'Peak Cells in Treat',
-                    '',
-                    '--- COST SUMMARY ---',
-                    'Equipment Cost ($)',
-                    'Water Purchase Cost ($)',
-                    'Water Trucking Cost ($)',
-                    'Water — Total ($)',
-                    'Leachate Disposal Cost ($)',
-                    'Leachate Trucking Cost ($)',
-                    'Leachate — Total ($)',
-                    'Amendment Cost ($)',
-                    'TOTAL PROJECT COST ($)',
-                    'Cost per CY ($/CY)',
-                    '',
-                    '--- EQUIPMENT BY TYPE ---',
-                    'Excavator ($)',
-                    'Loader ($)',
-                    'Bulldozer ($)',
-                    'Skidsteer ($)',
-                ]
-                summary_values = [
-                    params['TotalSoil_CY'],
-                    params['CellSize_CY'],
-                    params['NumCells'],
-                    total_flips,
-                    params['DailyLoad_CY'],
-                    cost_params_export.get('bottleneck', 'N/A'),
-                    params['StartDate'].strftime('%Y-%m-%d'),
-                    completion_date.strftime('%Y-%m-%d') if completion_date else 'N/A',
-                    total_days,
-                    schedule_for_export['CumSoilOut'].max(),
-                    len(filtered_idle_days),
-                    '',
-                    '',
-                    round(cost_summary_export.get('TotalWaterBBL', 0), 2),
-                    round(cost_summary_export.get('TotalLeachateBBL', 0), 2),
-                    round(cost_summary_export.get('PeakWaterBBL_Day', 0), 2),
-                    round(cost_summary_export.get('PeakLeachateBBL_Day', 0), 2),
-                    cost_summary_export.get('PeakCellsInTreat', 0),
-                    '',
-                    '',
-                    round(cost_summary_export.get('Equipment', 0), 2),
-                    round(cost_summary_export.get('WaterPurchase', 0), 2),
-                    round(cost_summary_export.get('WaterTrucking', 0), 2),
-                    round(cost_summary_export.get('Water', 0), 2),
-                    round(cost_summary_export.get('LeachateDisposal', 0), 2),
-                    round(cost_summary_export.get('LeachateTrucking', 0), 2),
-                    round(cost_summary_export.get('Leachate', 0), 2),
-                    round(cost_summary_export.get('Amendments', 0), 2),
-                    round(cost_summary_export.get('Total', 0), 2),
-                    round(cost_summary_export.get('CostPerCY', 0), 2),
-                    '',
-                    '',
-                    round(equip_by_type_exp.get('Excavator', 0), 2),
-                    round(equip_by_type_exp.get('Loader', 0), 2),
-                    round(equip_by_type_exp.get('Bulldozer', 0), 2),
-                    round(equip_by_type_exp.get('Skidsteer', 0), 2),
-                ]
-                summary_data = {'Metric': summary_metrics, 'Value': summary_values}
-                summary_df = pd.DataFrame(summary_data)
-                summary_df.to_excel(writer, sheet_name='Summary', index=False)
-                
-                # Cost Inputs sheet (record the rates used)
-                cost_inputs_data = {
-                    'Parameter': [
-                        '--- EQUIPMENT FLEET ---',
-                        '# Excavators',
-                        'Excavator capacity (CY/day each)',
-                        'Excavator $/day each',
-                        '# Loaders',
-                        'Loader capacity (CY/day each)',
-                        'Loader $/day each',
-                        '# Bulldozers',
-                        'Bulldozer $/day each',
-                        '# Skidsteers',
-                        'Skidsteer $/day each',
-                        'Derived daily soil capacity (CY)',
-                        'Bottleneck equipment',
-                        '',
-                        '--- WATER ---',
-                        'Water usage (BBL/CY total)',
-                        'Water cost ($/BBL)',
-                        'Water truck capacity (BBL)',
-                        'Water truck trip time (hr)',
-                        'Water truck $/hr',
-                        '',
-                        '--- LEACHATE ---',
-                        'Leachate collection (% of water)',
-                        'Leachate volume (BBL/CY) [derived]',
-                        'Leachate lag (days after water)',
-                        'Leachate disposal ($/BBL)',
-                        'Leachate truck capacity (BBL)',
-                        'Leachate truck trip time (hr)',
-                        'Leachate truck $/hr',
-                        '',
-                        '--- AMENDMENTS ---',
-                        'Amendment cost ($/CY)',
-                    ],
-                    'Value': [
-                        '',
-                        cost_params_export.get('n_excavator', 0),
-                        cost_params_export.get('excavator_capacity', 0),
-                        cost_params_export.get('excavator_daily', 0),
-                        cost_params_export.get('n_loader', 0),
-                        cost_params_export.get('loader_capacity', 0),
-                        cost_params_export.get('loader_daily', 0),
-                        cost_params_export.get('n_bulldozer', 0),
-                        cost_params_export.get('bulldozer_daily', 0),
-                        cost_params_export.get('n_skidsteer', 0),
-                        cost_params_export.get('skidsteer_daily', 0),
-                        cost_params_export.get('effective_daily_capacity', 0),
-                        cost_params_export.get('bottleneck', 'N/A'),
-                        '',
-                        '',
-                        cost_params_export.get('water_bbl_per_cy', 0),
-                        cost_params_export.get('water_cost_per_bbl', 0),
-                        cost_params_export.get('water_truck_capacity', 0),
-                        cost_params_export.get('water_truck_trip_hr', 0),
-                        cost_params_export.get('water_truck_hourly', 0),
-                        '',
-                        '',
-                        cost_params_export.get('leachate_pct_of_water', 0),
-                        round(cost_params_export.get('leachate_bbl_per_cy', 0), 4),
-                        cost_params_export.get('leachate_lag_days', 0),
-                        cost_params_export.get('leachate_cost_per_bbl', 0),
-                        cost_params_export.get('leachate_truck_capacity', 0),
-                        cost_params_export.get('leachate_truck_trip_hr', 0),
-                        cost_params_export.get('leachate_truck_hourly', 0),
-                        '',
-                        '',
-                        cost_params_export.get('amendment_cost_per_cy', 0),
-                    ]
-                }
-                cost_inputs_df = pd.DataFrame(cost_inputs_data)
-                cost_inputs_df.to_excel(writer, sheet_name='Cost_Inputs', index=False)
-                
-                # Apply formatting to Schedule sheet
-                workbook = writer.book
-                worksheet = writer.sheets['Schedule']
-                
-                # Define colors
-                phase_colors = {
-                    'Load': '#8ED973',
-                    'Rip': '#83CCEB',
-                    'Treat': '#FFC000',
-                    'Dry': '#F2CEEF',
-                    'Unload': '#00B0F0'
-                }
-                
-                sunday_fill = PatternFill(start_color='FFFFFF00', end_color='FFFFFF00', fill_type='solid')
-                idle_fill = PatternFill(start_color='FFFF0000', end_color='FFFF0000', fill_type='solid')
-                
-                thin_border = Border(
-                    left=Side(style='thin', color='000000'),
-                    right=Side(style='thin', color='000000'),
-                    top=Side(style='thin', color='000000'),
-                    bottom=Side(style='thin', color='000000')
-                )
-                aptos_font = Font(name='Aptos Narrow', size=10)
-                aptos_font_bold = Font(name='Aptos Narrow', size=10, bold=True)
-                center_aligned = Alignment(horizontal='center', vertical='center')
-                
-                # Find columns
-                cell_columns = []
-                date_column_idx = None
-                dayname_column_idx = None
-                money_column_idxs = set()
-                volume_column_idxs = set()
-                soil_column_idxs = set()
-                last_data_column_idx = len(schedule_for_export.columns)
-                
-                money_col_names = {'WaterCost_$', 'WaterTrucking_$', 'LeachateDisposal_$', 'LeachateTrucking_$', 'Amendments_$'}
-                volume_col_names = {'WaterIn_BBL', 'CumWaterIn_BBL', 'LeachateOut_BBL', 'CumLeachateOut_BBL'}
-                soil_col_names = {'SoilIn', 'SoilOut', 'CumSoilIn', 'CumSoilOut'}
-                
-                for col_idx, col_name in enumerate(schedule_for_export.columns, start=1):
-                    if 'Phase' in col_name:
-                        cell_columns.append((col_idx, col_name))
-                    if col_name == 'Date':
-                        date_column_idx = col_idx
-                    if col_name == 'DayName':
-                        dayname_column_idx = col_idx
-                    if col_name in money_col_names:
-                        money_column_idxs.add(col_idx)
-                    if col_name in volume_col_names:
-                        volume_column_idxs.add(col_idx)
-                    if col_name in soil_col_names:
-                        soil_column_idxs.add(col_idx)
-                
-                # Apply formatting
-                for row_idx in range(1, len(schedule_for_export) + 2):
-                    is_sunday = False
-                    is_idle_day = False
-                    
-                    if row_idx > 1:
-                        df_row_idx = schedule_for_export.index[row_idx - 2]
-                        is_idle_day = df_row_idx in filtered_idle_days
-                        
-                        if dayname_column_idx:
-                            day_name_cell = worksheet.cell(row=row_idx, column=dayname_column_idx)
-                            is_sunday = str(day_name_cell.value) == 'Sunday'
-                    
-                    for col_idx in range(1, last_data_column_idx + 1):
-                        cell = worksheet.cell(row=row_idx, column=col_idx)
-                        is_phase_column = any(col_idx == phase_col_idx for phase_col_idx, _ in cell_columns)
-                        
-                        cell.border = thin_border
-                        cell.font = aptos_font_bold if row_idx == 1 else aptos_font
-                        
-                        if col_idx == date_column_idx and row_idx > 1:
-                            cell.number_format = 'M/D/YYYY'
-                            if is_idle_day:
-                                cell.fill = idle_fill
-                        
-                        # Numeric formatting for new columns
-                        if row_idx > 1:
-                            if col_idx in money_column_idxs:
-                                cell.number_format = '"$"#,##0.00'
-                            elif col_idx in volume_column_idxs:
-                                cell.number_format = '#,##0.0'
-                            elif col_idx in soil_column_idxs:
-                                cell.number_format = '#,##0'
-                        
-                        if is_sunday and not is_phase_column and row_idx > 1 and col_idx != date_column_idx:
-                            cell.fill = sunday_fill
-                        
-                        if row_idx > 1:
-                            for phase_col_idx, phase_col_name in cell_columns:
-                                if col_idx == phase_col_idx:
-                                    cell.alignment = center_aligned
-                                    phase_value = str(cell.value) if cell.value else ''
-                                    
-                                    for phase_name, color in phase_colors.items():
-                                        if phase_name in phase_value:
-                                            hex_color = color.lstrip('#')
-                                            openpyxl_color = 'FF' + hex_color
-                                            cell.fill = PatternFill(start_color=openpyxl_color,
-                                                                  end_color=openpyxl_color,
-                                                                  fill_type='solid')
-                                            break
-                
-                # Auto-adjust column widths
-                for column_cells in worksheet.columns:
-                    length = max(len(str(cell.value) if cell.value else "") for cell in column_cells)
-                    worksheet.column_dimensions[get_column_letter(column_cells[0].column)].width = min(length + 2, 50)
+            # Create Excel file with formula-driven calculations
+            output = build_formula_excel(
+                schedule_for_export=schedule_for_export,
+                activities_df=activities_df,
+                params=params,
+                cost_params=cost_params_export,
+                cost_summary=cost_summary_export,
+                completion_date=completion_date,
+                total_days=total_days,
+                filtered_idle_days=filtered_idle_days,
+                total_flips=total_flips,
+                phases_df=phases_df_local,
+            )
             
             output.seek(0)
             
