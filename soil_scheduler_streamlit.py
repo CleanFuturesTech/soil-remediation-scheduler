@@ -3,7 +3,7 @@ Soil Remediation Scheduler - Streamlit Interactive App
 Interactive web app for multi-phase soil remediation with capacity pooling
 """
 
-APP_VERSION = "2.01"
+APP_VERSION = "2.03"
 
 import streamlit as st
 import pandas as pd
@@ -497,6 +497,70 @@ def detect_idle_capacity_days(schedule, params, phases_df):
 # Cost Calculations
 # ============================================================================
 
+def enrich_schedule_with_costs(schedule, daily_costs):
+    """
+    Merge daily cost and volume columns from daily_costs into the schedule.
+    Adds columns for water/leachate volumes and per-day cost breakdown,
+    placed in a logical order alongside the existing soil columns.
+    
+    Returns a new DataFrame; does not modify the input.
+    """
+    if daily_costs is None or daily_costs.empty:
+        return schedule.copy()
+    
+    # Columns from daily_costs we want to surface in the schedule
+    cost_cols_to_merge = [
+        'WaterBBL', 'LeachateBBL',
+        'WaterPurchaseCost', 'WaterTruckingCost',
+        'LeachateDisposalCost', 'LeachateTruckingCost',
+        'AmendmentCost',
+    ]
+    available_cols = [c for c in cost_cols_to_merge if c in daily_costs.columns]
+    
+    merge_df = daily_costs[['Date'] + available_cols].copy()
+    
+    enriched = schedule.merge(merge_df, on='Date', how='left')
+    
+    # Fill any NaNs (days outside daily_costs window) with 0
+    for c in available_cols:
+        if c in enriched.columns:
+            enriched[c] = enriched[c].fillna(0)
+    
+    # Compute cumulative water in and leachate out for the schedule view
+    if 'WaterBBL' in enriched.columns:
+        enriched['CumWaterBBL'] = enriched['WaterBBL'].cumsum()
+    if 'LeachateBBL' in enriched.columns:
+        enriched['CumLeachateBBL'] = enriched['LeachateBBL'].cumsum()
+    
+    # Friendly aliases that match the user's mental model
+    rename_map = {
+        'WaterBBL':              'WaterIn_BBL',
+        'LeachateBBL':           'LeachateOut_BBL',
+        'CumWaterBBL':           'CumWaterIn_BBL',
+        'CumLeachateBBL':        'CumLeachateOut_BBL',
+        'WaterPurchaseCost':     'WaterCost_$',
+        'WaterTruckingCost':     'WaterTrucking_$',
+        'LeachateDisposalCost':  'LeachateDisposal_$',
+        'LeachateTruckingCost':  'LeachateTrucking_$',
+        'AmendmentCost':         'Amendments_$',
+    }
+    enriched = enriched.rename(columns=rename_map)
+    
+    # Reorder columns: identifiers first, soil volumes, water/leachate volumes,
+    # daily costs, then cell phases
+    id_cols  = [c for c in ['Month', 'Week', 'Day Count', 'Date', 'DayName'] if c in enriched.columns]
+    soil_cols = [c for c in ['SoilIn', 'CumSoilIn', 'SoilOut', 'CumSoilOut'] if c in enriched.columns]
+    vol_cols = [c for c in ['WaterIn_BBL', 'CumWaterIn_BBL', 'LeachateOut_BBL', 'CumLeachateOut_BBL'] if c in enriched.columns]
+    cost_cols_ordered = [c for c in ['WaterCost_$', 'WaterTrucking_$', 'LeachateDisposal_$', 'LeachateTrucking_$', 'Amendments_$'] if c in enriched.columns]
+    # Everything else (cell phase cols, etc.) at the end
+    placed = set(id_cols + soil_cols + vol_cols + cost_cols_ordered)
+    other_cols = [c for c in enriched.columns if c not in placed]
+    
+    enriched = enriched[id_cols + soil_cols + vol_cols + cost_cols_ordered + other_cols]
+    
+    return enriched
+
+
 def calculate_costs(activities, schedule, params, cost_params, phases_df):
     """
     Calculate daily and total costs for the remediation project.
@@ -885,7 +949,7 @@ def main():
             st.caption(f"Effective trucking: ${leachate_trucking_per_bbl:.3f}/BBL = ${leachate_trucking_per_bbl * leachate_bbl_per_cy:.2f}/CY")
     
     with st.sidebar.expander("⚗️ Amendments", expanded=False):
-        amendment_cost_per_cy = st.number_input("Amendment cost ($/CY)", min_value=0.0, value=12.0, step=0.5, key='amendment_cost_per_cy',
+        amendment_cost_per_cy = st.number_input("Amendment cost ($/CY)", min_value=0.0, value=4.0, step=0.5, key='amendment_cost_per_cy',
                                                   help="Lump cost per CY; mixture breakdown coming later")
         st.caption("Charged on first Treat day of each flip")
     
@@ -950,9 +1014,13 @@ def main():
             # Calculate costs
             daily_costs, cost_summary = calculate_costs(all_activities, schedule, params, cost_params, phases_df)
             
+            # Enrich the schedule with cost and volume columns (for display + export)
+            enriched_schedule = enrich_schedule_with_costs(schedule, daily_costs)
+            
             # Store in session state
             st.session_state.activities = all_activities
-            st.session_state.schedule = schedule
+            st.session_state.schedule = enriched_schedule
+            st.session_state.schedule_raw = schedule   # original soil-only schedule (kept for any internal use)
             st.session_state.params = params
             st.session_state.phases_df = phases_df
             st.session_state.idle_days_count = idle_days_count
@@ -1026,7 +1094,29 @@ def main():
         
         with tab1:
             st.subheader("Daily Schedule")
-            st.dataframe(schedule, use_container_width=True, height=600)
+            
+            # Build column-level formatting for cost & volume columns
+            schedule_col_config = {}
+            money_cols_in_sched = ['WaterCost_$', 'WaterTrucking_$', 'LeachateDisposal_$', 'LeachateTrucking_$', 'Amendments_$']
+            for c in money_cols_in_sched:
+                if c in schedule.columns:
+                    schedule_col_config[c] = st.column_config.NumberColumn(c, format="$%.2f")
+            vol_cols_in_sched = ['WaterIn_BBL', 'CumWaterIn_BBL', 'LeachateOut_BBL', 'CumLeachateOut_BBL']
+            for c in vol_cols_in_sched:
+                if c in schedule.columns:
+                    schedule_col_config[c] = st.column_config.NumberColumn(c, format="%.1f")
+            soil_cols_in_sched = ['SoilIn', 'CumSoilIn', 'SoilOut', 'CumSoilOut']
+            for c in soil_cols_in_sched:
+                if c in schedule.columns:
+                    schedule_col_config[c] = st.column_config.NumberColumn(c, format="%d")
+            
+            st.dataframe(
+                schedule,
+                use_container_width=True,
+                height=600,
+                column_config=schedule_col_config,
+                hide_index=True,
+            )
         
         with tab2:
             st.subheader("Cell Activities Log")
@@ -1360,6 +1450,10 @@ def main():
             cost_summary_export = st.session_state.get('cost_summary', {})
             cost_params_export = st.session_state.get('cost_params', {})
             
+            # Enrich the exported schedule with the same cost & volume columns
+            # used in the online display
+            schedule_for_export = enrich_schedule_with_costs(schedule_for_export, daily_costs_export)
+            
             # Create Excel file with formatting
             output = BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -1557,7 +1651,14 @@ def main():
                 cell_columns = []
                 date_column_idx = None
                 dayname_column_idx = None
+                money_column_idxs = set()
+                volume_column_idxs = set()
+                soil_column_idxs = set()
                 last_data_column_idx = len(schedule_for_export.columns)
+                
+                money_col_names = {'WaterCost_$', 'WaterTrucking_$', 'LeachateDisposal_$', 'LeachateTrucking_$', 'Amendments_$'}
+                volume_col_names = {'WaterIn_BBL', 'CumWaterIn_BBL', 'LeachateOut_BBL', 'CumLeachateOut_BBL'}
+                soil_col_names = {'SoilIn', 'SoilOut', 'CumSoilIn', 'CumSoilOut'}
                 
                 for col_idx, col_name in enumerate(schedule_for_export.columns, start=1):
                     if 'Phase' in col_name:
@@ -1566,6 +1667,12 @@ def main():
                         date_column_idx = col_idx
                     if col_name == 'DayName':
                         dayname_column_idx = col_idx
+                    if col_name in money_col_names:
+                        money_column_idxs.add(col_idx)
+                    if col_name in volume_col_names:
+                        volume_column_idxs.add(col_idx)
+                    if col_name in soil_col_names:
+                        soil_column_idxs.add(col_idx)
                 
                 # Apply formatting
                 for row_idx in range(1, len(schedule_for_export) + 2):
@@ -1591,6 +1698,15 @@ def main():
                             cell.number_format = 'M/D/YYYY'
                             if is_idle_day:
                                 cell.fill = idle_fill
+                        
+                        # Numeric formatting for new columns
+                        if row_idx > 1:
+                            if col_idx in money_column_idxs:
+                                cell.number_format = '"$"#,##0.00'
+                            elif col_idx in volume_column_idxs:
+                                cell.number_format = '#,##0.0'
+                            elif col_idx in soil_column_idxs:
+                                cell.number_format = '#,##0'
                         
                         if is_sunday and not is_phase_column and row_idx > 1 and col_idx != date_column_idx:
                             cell.fill = sunday_fill
