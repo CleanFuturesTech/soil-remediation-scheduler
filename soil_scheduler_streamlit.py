@@ -3,6 +3,8 @@ Soil Remediation Scheduler - Streamlit Interactive App
 Interactive web app for multi-phase soil remediation with capacity pooling
 """
 
+APP_VERSION = "2.01"
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -492,11 +494,223 @@ def detect_idle_capacity_days(schedule, params, phases_df):
 
 
 # ============================================================================
+# Cost Calculations
+# ============================================================================
+
+def calculate_costs(activities, schedule, params, cost_params, phases_df):
+    """
+    Calculate daily and total costs for the remediation project.
+    
+    Cost categories:
+    - Equipment: daily fleet rental (excavator, loader, bulldozer, skidsteer)
+                 charged for every day of project duration
+    - Water purchase: BBL/day × $/BBL, where daily BBL is driven by cells in Treat today
+    - Water trucking: truck-hours × $/hr, based on BBLs hauled
+    - Leachate disposal: $/BBL × daily BBL, where daily BBL = pct × water_(today - lag_days)
+    - Leachate trucking: truck-hours × $/hr, based on BBLs hauled
+    - Amendments: $/CY, charged on first Treat day per flip (lump per flip)
+    
+    Water/leachate model mirrors the spreadsheet:
+      water_BBL_today = water_BBL_per_CY × cell_size × N_cells_in_Treat / treat_duration
+      leachate_BBL_today = leachate_pct × water_BBL_(today - lag_days)
+    
+    Returns:
+        daily_costs_df: per-day cost breakdown
+        summary: dict of total costs by category
+    """
+    # ---------- Per-flip soil volumes & treat schedules ----------
+    flip_cy = {}            # flip_num -> total CY loaded
+    flip_first_treat = {}   # flip_num -> first Treat date (for amendments)
+    
+    for act in activities:
+        fn = act['FlipNum']
+        if 'Load' in act['Phase']:
+            flip_cy[fn] = flip_cy.get(fn, 0) + act['SoilIn']
+        elif act['Phase'] == 'Treat':
+            if fn not in flip_first_treat:
+                flip_first_treat[fn] = act['Date']
+    
+    # ---------- Treat duration (days) ----------
+    try:
+        treat_duration_days = int(phases_df[phases_df['Phase'] == 'Treat']['Duration_Days'].iloc[0])
+    except Exception:
+        treat_duration_days = 3
+    if treat_duration_days <= 0:
+        treat_duration_days = 1
+    
+    # ---------- Cell-size for daily water calc ----------
+    cell_size_cy = params.get('CellSize_CY', 0)
+    
+    # ---------- Initialize daily cost dataframe ----------
+    daily_costs = pd.DataFrame({
+        'Date': schedule['Date'].values,
+        'ExcavatorCost': 0.0,
+        'LoaderCost': 0.0,
+        'BulldozerCost': 0.0,
+        'SkidsteerCost': 0.0,
+        'EquipmentCost': 0.0,
+        'CellsInTreat': 0,
+        'WaterBBL': 0.0,
+        'WaterPurchaseCost': 0.0,
+        'WaterTruckingCost': 0.0,
+        'WaterCost': 0.0,
+        'LeachateBBL': 0.0,
+        'LeachateDisposalCost': 0.0,
+        'LeachateTruckingCost': 0.0,
+        'LeachateCost': 0.0,
+        'AmendmentCost': 0.0,
+    })
+    daily_costs = daily_costs.set_index('Date')
+    
+    # ---------- Equipment costs (daily fleet rental for every day in schedule) ----------
+    daily_excavator = cost_params.get('n_excavator', 0) * cost_params.get('excavator_daily', 0.0)
+    daily_loader    = cost_params.get('n_loader', 0)    * cost_params.get('loader_daily', 0.0)
+    daily_bulldozer = cost_params.get('n_bulldozer', 0) * cost_params.get('bulldozer_daily', 0.0)
+    daily_skidsteer = cost_params.get('n_skidsteer', 0) * cost_params.get('skidsteer_daily', 0.0)
+    daily_fleet_cost = daily_excavator + daily_loader + daily_bulldozer + daily_skidsteer
+    
+    for date in daily_costs.index:
+        daily_costs.at[date, 'ExcavatorCost'] = daily_excavator
+        daily_costs.at[date, 'LoaderCost']    = daily_loader
+        daily_costs.at[date, 'BulldozerCost'] = daily_bulldozer
+        daily_costs.at[date, 'SkidsteerCost'] = daily_skidsteer
+        daily_costs.at[date, 'EquipmentCost'] = daily_fleet_cost
+    
+    # ---------- Water (per-day from cells in Treat) ----------
+    water_bbl_per_cy   = cost_params.get('water_bbl_per_cy', 0.0)
+    water_cost_per_bbl = cost_params.get('water_cost_per_bbl', 0.0)
+    water_truck_cap    = cost_params.get('water_truck_capacity', 120)
+    water_trip_hr      = cost_params.get('water_truck_trip_hr', 1.5)
+    water_truck_rate   = cost_params.get('water_truck_hourly', 95.0)
+    water_truck_cost_per_bbl = (water_trip_hr * water_truck_rate / water_truck_cap) if water_truck_cap > 0 else 0.0
+    
+    # BBL per cell-day in Treat = total_water_per_CY × cell_size / treat_duration_days
+    water_bbl_per_treat_cell_day = (water_bbl_per_cy * cell_size_cy / treat_duration_days) if treat_duration_days > 0 else 0.0
+    
+    # Count cells in Treat each day from the schedule
+    num_cells = int(params['NumCells'])
+    cell_cols = [f'Cell{i}Phase' for i in range(1, num_cells + 1)]
+    
+    # Build a list of (date, n_treat) so we can apply leachate lag by index
+    schedule_dates = list(schedule['Date'].values)
+    n_treat_by_date_idx = []
+    
+    for idx, row in schedule.iterrows():
+        date = row['Date']
+        if date not in daily_costs.index:
+            n_treat_by_date_idx.append(0)
+            continue
+        
+        n_treat = 0
+        for col in cell_cols:
+            phase_str = str(row[col]) if pd.notna(row[col]) else ''
+            if 'Treat' in phase_str:
+                n_treat += 1
+        
+        n_treat_by_date_idx.append(n_treat)
+        
+        water_bbl = n_treat * water_bbl_per_treat_cell_day
+        daily_costs.at[date, 'CellsInTreat'] = n_treat
+        daily_costs.at[date, 'WaterBBL'] = water_bbl
+        daily_costs.at[date, 'WaterPurchaseCost'] = water_bbl * water_cost_per_bbl
+        daily_costs.at[date, 'WaterTruckingCost'] = water_bbl * water_truck_cost_per_bbl
+        daily_costs.at[date, 'WaterCost'] = daily_costs.at[date, 'WaterPurchaseCost'] + daily_costs.at[date, 'WaterTruckingCost']
+    
+    # ---------- Leachate (3-day lag from water by default) ----------
+    leachate_pct       = cost_params.get('leachate_pct_of_water', 80) / 100.0
+    leachate_lag       = int(cost_params.get('leachate_lag_days', 3))
+    leachate_cost_per_bbl = cost_params.get('leachate_cost_per_bbl', 0.0)
+    leachate_truck_cap = cost_params.get('leachate_truck_capacity', 120)
+    leachate_trip_hr   = cost_params.get('leachate_truck_trip_hr', 1.0)
+    leachate_truck_rate = cost_params.get('leachate_truck_hourly', 95.0)
+    leachate_truck_cost_per_bbl = (leachate_trip_hr * leachate_truck_rate / leachate_truck_cap) if leachate_truck_cap > 0 else 0.0
+    if cost_params.get('onsite_evap_pond', False):
+        leachate_truck_cost_per_bbl = 0.0  # Pumped to onsite pond — no trucking
+    
+    n_dates = len(schedule_dates)
+    for src_idx in range(n_dates):
+        water_bbl_that_day = n_treat_by_date_idx[src_idx] * water_bbl_per_treat_cell_day
+        if water_bbl_that_day <= 0:
+            continue
+        
+        # Target day for leachate
+        tgt_idx = min(src_idx + leachate_lag, n_dates - 1)  # clamp to last day if lag exceeds buffer
+        tgt_date = schedule_dates[tgt_idx]
+        if tgt_date not in daily_costs.index:
+            continue
+        
+        leachate_bbl = water_bbl_that_day * leachate_pct
+        daily_costs.at[tgt_date, 'LeachateBBL'] += leachate_bbl
+        daily_costs.at[tgt_date, 'LeachateDisposalCost'] += leachate_bbl * leachate_cost_per_bbl
+        daily_costs.at[tgt_date, 'LeachateTruckingCost'] += leachate_bbl * leachate_truck_cost_per_bbl
+    
+    daily_costs['LeachateCost'] = daily_costs['LeachateDisposalCost'] + daily_costs['LeachateTruckingCost']
+    
+    # ---------- Amendments (lump sum on first Treat day per flip) ----------
+    amendment_cost_per_cy = cost_params.get('amendment_cost_per_cy', 0.0)
+    
+    for fn, cy in flip_cy.items():
+        if fn in flip_first_treat:
+            first_date = flip_first_treat[fn]
+            if first_date in daily_costs.index:
+                daily_costs.at[first_date, 'AmendmentCost'] += cy * amendment_cost_per_cy
+    
+    # ---------- Totals & cumulative ----------
+    daily_costs['TotalCost'] = (
+        daily_costs['EquipmentCost'] +
+        daily_costs['WaterCost'] +
+        daily_costs['LeachateCost'] +
+        daily_costs['AmendmentCost']
+    )
+    daily_costs['CumTotalCost'] = daily_costs['TotalCost'].cumsum()
+    daily_costs = daily_costs.reset_index()
+    
+    # ---------- Summary ----------
+    total_cy = params['TotalSoil_CY']
+    project_days = len(daily_costs)
+    
+    summary = {
+        'Equipment': daily_costs['EquipmentCost'].sum(),
+        'WaterPurchase':    daily_costs['WaterPurchaseCost'].sum(),
+        'WaterTrucking':    daily_costs['WaterTruckingCost'].sum(),
+        'Water':            daily_costs['WaterCost'].sum(),
+        'LeachateDisposal': daily_costs['LeachateDisposalCost'].sum(),
+        'LeachateTrucking': daily_costs['LeachateTruckingCost'].sum(),
+        'Leachate':         daily_costs['LeachateCost'].sum(),
+        'Amendments':       daily_costs['AmendmentCost'].sum(),
+    }
+    summary['Total'] = (
+        summary['Equipment'] + summary['Water'] + summary['Leachate'] + summary['Amendments']
+    )
+    summary['CostPerCY'] = summary['Total'] / total_cy if total_cy > 0 else 0.0
+    summary['ProjectDays'] = project_days
+    
+    # Equipment breakdown by type
+    summary['EquipmentByType'] = {
+        'Excavator': daily_costs['ExcavatorCost'].sum(),
+        'Loader':    daily_costs['LoaderCost'].sum(),
+        'Bulldozer': daily_costs['BulldozerCost'].sum(),
+        'Skidsteer': daily_costs['SkidsteerCost'].sum(),
+    }
+    
+    # Material volumes
+    summary['TotalWaterBBL']    = daily_costs['WaterBBL'].sum()
+    summary['TotalLeachateBBL'] = daily_costs['LeachateBBL'].sum()
+    
+    # Peak day metrics (useful for fleet sizing)
+    summary['PeakWaterBBL_Day']    = daily_costs['WaterBBL'].max()
+    summary['PeakLeachateBBL_Day'] = daily_costs['LeachateBBL'].max()
+    summary['PeakCellsInTreat']    = int(daily_costs['CellsInTreat'].max())
+    
+    return daily_costs, summary
+
+
+# ============================================================================
 # Streamlit UI
 # ============================================================================
 
 def main():
-    st.set_page_config(page_title="Soil Remediation Scheduler", layout="wide")
+    st.set_page_config(page_title=f"Soil Remediation Scheduler v{APP_VERSION}", layout="wide")
     
     # Display company logo
     col1, col2, col3 = st.columns([1, 2, 1])
@@ -504,17 +718,17 @@ def main():
         st.image("Clean_Futures_2.png", use_container_width=True)
     
     st.title("🏗️ Soil Remediation Scheduler")
-    st.markdown("**Interactive multi-phase soil remediation simulator with capacity pooling**")
+    st.markdown(f"**Interactive multi-phase soil remediation simulator with capacity pooling** &nbsp; · &nbsp; `v{APP_VERSION}`")
     
     # Sidebar for parameters
     st.sidebar.header("📋 Project Parameters")
     
-    total_soil = st.sidebar.number_input("Total Soil (CY)", min_value=100, max_value=100000, value=36000, step=100)
-    cell_size = st.sidebar.number_input("Cell Size (CY)", min_value=100, max_value=10000, value=4500, step=100)
+    total_soil = st.sidebar.number_input("Total Soil (CY)", min_value=100, max_value=100000, value=16000, step=100)
+    cell_size = st.sidebar.number_input("Cell Size (CY)", min_value=100, max_value=10000, value=1500, step=100)
     num_cells = st.sidebar.number_input("Number of Cells", min_value=1, max_value=20, value=4)
-    daily_load = st.sidebar.number_input("Daily Load Capacity (CY)", min_value=100, max_value=10000, value=1500, step=100)
-    daily_unload = st.sidebar.number_input("Daily Unload Capacity (CY)", min_value=100, max_value=10000, value=1500, step=100)
-    start_date = st.sidebar.date_input("Start Date", value=datetime(2025, 12, 1))
+    start_date = st.sidebar.date_input("Start Date", value=datetime(2026, 6, 1))
+    
+    st.sidebar.caption("ℹ️ Daily soil-movement capacity is derived from the equipment fleet below.")
     
     st.sidebar.markdown("---")
     st.sidebar.header("⚙️ Phase Settings")
@@ -572,16 +786,159 @@ def main():
     phases_df.loc[phases_df['Phase'] == 'Unload', 'Saturday'] = 'yes' if unload_sat else 'no'
     phases_df.loc[phases_df['Phase'] == 'Unload', 'Sunday'] = 'yes' if unload_sun else 'no'
     
+    # ============================================================
+    # Equipment Fleet & Cost Inputs
+    # ============================================================
+    st.sidebar.markdown("---")
+    st.sidebar.header("🚜 Equipment Fleet")
+    
+    with st.sidebar.expander("Excavator (excavates soil, gates load/unload)", expanded=True):
+        n_excavator = st.number_input("# Excavators", min_value=1, max_value=10, value=1, step=1, key='n_excavator')
+        excavator_capacity = st.number_input("CY/day per excavator", min_value=50, max_value=5000, value=750, step=50, key='excavator_capacity')
+        excavator_daily = st.number_input("$/day per excavator", min_value=0.0, value=800.0, step=50.0, key='excavator_daily')
+    
+    with st.sidebar.expander("Rubber Tire Loader (moves piles)", expanded=True):
+        n_loader = st.number_input("# Loaders", min_value=1, max_value=10, value=1, step=1, key='n_loader')
+        loader_capacity = st.number_input("CY/day per loader", min_value=50, max_value=5000, value=750, step=50, key='loader_capacity')
+        loader_daily = st.number_input("$/day per loader", min_value=0.0, value=600.0, step=50.0, key='loader_daily')
+    
+    with st.sidebar.expander("Bulldozer (levels for treat, rips cells)", expanded=False):
+        n_bulldozer = st.number_input("# Bulldozers", min_value=0, max_value=10, value=1, step=1, key='n_bulldozer')
+        bulldozer_daily = st.number_input("$/day per bulldozer", min_value=0.0, value=900.0, step=50.0, key='bulldozer_daily')
+        st.caption("Bulldozer is on site daily; doesn't gate soil throughput.")
+    
+    with st.sidebar.expander("Skidsteer (on site, not in soil processing)", expanded=False):
+        n_skidsteer = st.number_input("# Skidsteers", min_value=0, max_value=10, value=1, step=1, key='n_skidsteer')
+        skidsteer_daily = st.number_input("$/day per skidsteer", min_value=0.0, value=300.0, step=25.0, key='skidsteer_daily')
+    
+    # Derived daily soil-movement capacity (bottleneck of excavator vs loader fleet)
+    excavator_fleet_capacity = n_excavator * excavator_capacity
+    loader_fleet_capacity = n_loader * loader_capacity
+    effective_daily_capacity = min(excavator_fleet_capacity, loader_fleet_capacity)
+    bottleneck = "Excavator" if excavator_fleet_capacity <= loader_fleet_capacity else "Loader"
+    
+    st.sidebar.success(
+        f"**Daily Soil Capacity: {effective_daily_capacity:,} CY**  \n"
+        f"Bottleneck: {bottleneck} fleet  \n"
+        f"Excavator fleet: {excavator_fleet_capacity:,} CY/day  \n"
+        f"Loader fleet: {loader_fleet_capacity:,} CY/day  \n"
+        f"_(Shared pool for load + unload)_"
+    )
+    
+    # ============================================================
+    # Material Costs
+    # ============================================================
+    st.sidebar.markdown("---")
+    st.sidebar.header("💰 Material Costs")
+    
+    with st.sidebar.expander("💧 Water", expanded=False):
+        water_bbl_per_cy = st.number_input("Water usage (BBL/CY total per treat cycle)", min_value=0.0, max_value=10.0, value=1.5, step=0.1, key='water_bbl_per_cy',
+                                            help="Total water per CY across the full treat phase. Typical: 0.5 – 5 BBL/CY")
+        
+        onsite_water_well = st.toggle("Onsite freshwater well (water is free)", value=False, key='onsite_water_well',
+                                       help="If enabled, water purchase cost is zero. Volume is still tracked for reporting.")
+        
+        if onsite_water_well:
+            water_cost_per_bbl = 0.0
+            st.caption("✅ Onsite well: $0.00/BBL water purchase. Volume still tracked.")
+        else:
+            water_cost_per_bbl = st.number_input("Water cost ($/BBL)", min_value=0.0, max_value=20.0, value=1.00, step=0.25, format="%.2f", key='water_cost_per_bbl',
+                                                  help="Typical: $0.25 – $5.00/BBL")
+            st.caption(f"Effective: ${water_bbl_per_cy * water_cost_per_bbl:.2f}/CY • Distributed across Treat days")
+        
+        st.markdown("**Water Trucking**")
+        water_truck_capacity = st.number_input("Water truck capacity (BBL/truck)", min_value=10, max_value=500, value=120, step=10, key='water_truck_capacity')
+        water_truck_trip_hr = st.number_input("Water truck round-trip time (hr)", min_value=0.1, max_value=12.0, value=1.5, step=0.1, key='water_truck_trip_hr')
+        water_truck_hourly = st.number_input("Water truck $/hr", min_value=0.0, value=95.0, step=5.0, key='water_truck_hourly')
+        water_trucking_per_bbl = (water_truck_trip_hr * water_truck_hourly) / water_truck_capacity if water_truck_capacity > 0 else 0
+        if onsite_water_well:
+            st.caption(f"⚠️ Trucking still applies if well is offsite or capacity insufficient. Effective: ${water_trucking_per_bbl:.3f}/BBL")
+        else:
+            st.caption(f"Effective trucking: ${water_trucking_per_bbl:.3f}/BBL = ${water_trucking_per_bbl * water_bbl_per_cy:.2f}/CY")
+    
+    with st.sidebar.expander("🛢️ Leachate Disposal", expanded=False):
+        leachate_pct_of_water = st.slider("Leachate collected (% of water used)", min_value=0, max_value=100, value=80, step=5, key='leachate_pct_of_water',
+                                            help="Typical: 75% – 100% of water becomes leachate")
+        leachate_lag_days = st.number_input("Leachate timing lag (days after water)", min_value=0, max_value=10, value=3, step=1, key='leachate_lag_days',
+                                              help="Days between water addition and leachate emergence. Default 3 matches percolation through treated soil.")
+        leachate_bbl_per_cy = water_bbl_per_cy * (leachate_pct_of_water / 100.0)
+        
+        onsite_evap_pond = st.toggle("Onsite evaporation pond (disposal is free)", value=False, key='onsite_evap_pond',
+                                      help="If enabled, leachate disposal and trucking costs are zero. Volume is still tracked.")
+        
+        if onsite_evap_pond:
+            leachate_cost_per_bbl = 0.0
+            st.caption(f"✅ Onsite evap pond: $0.00/BBL disposal. Leachate volume: {leachate_bbl_per_cy:.2f} BBL/CY (still tracked).")
+        else:
+            leachate_cost_per_bbl = st.number_input("Leachate disposal ($/BBL)", min_value=0.0, max_value=20.0, value=0.25, step=0.25, format="%.2f", key='leachate_cost_per_bbl',
+                                                      help="Typical: $0.25 – $5.00/BBL")
+            st.caption(f"Leachate: {leachate_bbl_per_cy:.2f} BBL/CY • Disposal: ${leachate_bbl_per_cy * leachate_cost_per_bbl:.2f}/CY • Emerges {leachate_lag_days}d after water added")
+        
+        st.markdown("**Leachate Trucking**")
+        leachate_truck_capacity = st.number_input("Leachate truck capacity (BBL/truck)", min_value=10, max_value=500, value=120, step=10, key='leachate_truck_capacity')
+        leachate_truck_trip_hr = st.number_input("Leachate truck round-trip time (hr)", min_value=0.1, max_value=12.0, value=1.0, step=0.1, key='leachate_truck_trip_hr')
+        leachate_truck_hourly = st.number_input("Leachate truck $/hr", min_value=0.0, value=95.0, step=5.0, key='leachate_truck_hourly')
+        leachate_trucking_per_bbl = (leachate_truck_trip_hr * leachate_truck_hourly) / leachate_truck_capacity if leachate_truck_capacity > 0 else 0
+        if onsite_evap_pond:
+            st.caption("✅ Onsite pond: no leachate trucking cost (pumped to pond on-site).")
+        else:
+            st.caption(f"Effective trucking: ${leachate_trucking_per_bbl:.3f}/BBL = ${leachate_trucking_per_bbl * leachate_bbl_per_cy:.2f}/CY")
+    
+    with st.sidebar.expander("⚗️ Amendments", expanded=False):
+        amendment_cost_per_cy = st.number_input("Amendment cost ($/CY)", min_value=0.0, value=12.0, step=0.5, key='amendment_cost_per_cy',
+                                                  help="Lump cost per CY; mixture breakdown coming later")
+        st.caption("Charged on first Treat day of each flip")
+    
+    # Workday hours (used for trucks-required display only)
+    workday_hours = 8.0  # informational; doesn't affect cost
+    
+    # Build cost params dict
+    cost_params = {
+        # Equipment fleet
+        'n_excavator': n_excavator,
+        'excavator_capacity': excavator_capacity,
+        'excavator_daily': excavator_daily,
+        'n_loader': n_loader,
+        'loader_capacity': loader_capacity,
+        'loader_daily': loader_daily,
+        'n_bulldozer': n_bulldozer,
+        'bulldozer_daily': bulldozer_daily,
+        'n_skidsteer': n_skidsteer,
+        'skidsteer_daily': skidsteer_daily,
+        'effective_daily_capacity': effective_daily_capacity,
+        'bottleneck': bottleneck,
+        # Water
+        'water_bbl_per_cy': water_bbl_per_cy,
+        'water_cost_per_bbl': water_cost_per_bbl,
+        'onsite_water_well': onsite_water_well,
+        'water_truck_capacity': water_truck_capacity,
+        'water_truck_trip_hr': water_truck_trip_hr,
+        'water_truck_hourly': water_truck_hourly,
+        # Leachate
+        'leachate_pct_of_water': leachate_pct_of_water,
+        'leachate_bbl_per_cy': leachate_bbl_per_cy,
+        'leachate_cost_per_bbl': leachate_cost_per_bbl,
+        'leachate_lag_days': leachate_lag_days,
+        'onsite_evap_pond': onsite_evap_pond,
+        'leachate_truck_capacity': leachate_truck_capacity,
+        'leachate_truck_trip_hr': leachate_truck_trip_hr,
+        'leachate_truck_hourly': leachate_truck_hourly,
+        # Amendments
+        'amendment_cost_per_cy': amendment_cost_per_cy,
+        # Misc
+        'workday_hours': workday_hours,
+    }
+    
     # Run button
     if st.sidebar.button("▶️ Run Simulation", type="primary", use_container_width=True):
         
-        # Prepare parameters
+        # Prepare parameters - daily soil capacity is the equipment bottleneck (shared load+unload pool)
         params = {
             'TotalSoil_CY': total_soil,
             'CellSize_CY': cell_size,
             'NumCells': num_cells,
-            'DailyLoad_CY': daily_load,
-            'DailyUnload_CY': daily_unload,
+            'DailyLoad_CY': effective_daily_capacity,
+            'DailyUnload_CY': effective_daily_capacity,
             'StartDate': datetime.combine(start_date, datetime.min.time())
         }
         
@@ -590,12 +947,18 @@ def main():
             all_activities = simulate_remediation(params, phases_df)
             schedule, idle_days_count = build_schedule(all_activities, params, phases_df)
             
+            # Calculate costs
+            daily_costs, cost_summary = calculate_costs(all_activities, schedule, params, cost_params, phases_df)
+            
             # Store in session state
             st.session_state.activities = all_activities
             st.session_state.schedule = schedule
             st.session_state.params = params
             st.session_state.phases_df = phases_df
             st.session_state.idle_days_count = idle_days_count
+            st.session_state.cost_params = cost_params
+            st.session_state.daily_costs = daily_costs
+            st.session_state.cost_summary = cost_summary
     
     # Display results if available
     if 'schedule' in st.session_state:
@@ -610,6 +973,7 @@ def main():
         
         total_flips = math.ceil(params['TotalSoil_CY'] / params['CellSize_CY'])
         idle_days_count = st.session_state.get('idle_days_count', 0)
+        cost_summary = st.session_state.get('cost_summary', {})
         
         with col1:
             st.metric("Total Soil", f"{params['TotalSoil_CY']:,} CY")
@@ -639,8 +1003,26 @@ def main():
         with col6:
             st.metric("Idle Days", idle_days_count, help="Days when loader capacity was available but no cells were ready")
         
+        # Second row: cost metrics
+        if cost_summary:
+            cc1, cc2, cc3, cc4, cc5, cc6 = st.columns(6)
+            with cc1:
+                st.metric("💰 Total Cost", f"${cost_summary.get('Total', 0):,.0f}")
+            with cc2:
+                st.metric("$ / CY", f"${cost_summary.get('CostPerCY', 0):,.2f}")
+            with cc3:
+                st.metric("Equipment", f"${cost_summary.get('Equipment', 0):,.0f}")
+            with cc4:
+                st.metric("Water (all-in)", f"${cost_summary.get('Water', 0):,.0f}",
+                          help=f"Purchase ${cost_summary.get('WaterPurchase', 0):,.0f} + Trucking ${cost_summary.get('WaterTrucking', 0):,.0f}")
+            with cc5:
+                st.metric("Leachate (all-in)", f"${cost_summary.get('Leachate', 0):,.0f}",
+                          help=f"Disposal ${cost_summary.get('LeachateDisposal', 0):,.0f} + Trucking ${cost_summary.get('LeachateTrucking', 0):,.0f}")
+            with cc6:
+                st.metric("Amendments", f"${cost_summary.get('Amendments', 0):,.0f}")
+        
         # Tabs for different views
-        tab1, tab2, tab3, tab4 = st.tabs(["📅 Schedule", "📋 Activities", "📈 Charts", "💾 Export"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📅 Schedule", "📋 Activities", "📈 Charts", "💰 Costs", "💾 Export"])
         
         with tab1:
             st.subheader("Daily Schedule")
@@ -701,6 +1083,201 @@ def main():
             st.plotly_chart(fig2, use_container_width=True)
         
         with tab4:
+            st.subheader("💰 Cost Breakdown")
+            
+            daily_costs = st.session_state.get('daily_costs')
+            cost_summary = st.session_state.get('cost_summary', {})
+            
+            if daily_costs is None or daily_costs.empty:
+                st.info("No cost data available. Re-run the simulation.")
+            else:
+                # Summary table
+                st.markdown("### Project Totals")
+                
+                summary_rows = [
+                    {'Category': 'Equipment',          'Cost': cost_summary.get('Equipment', 0)},
+                    {'Category': 'Water — Purchase',   'Cost': cost_summary.get('WaterPurchase', 0)},
+                    {'Category': 'Water — Trucking',   'Cost': cost_summary.get('WaterTrucking', 0)},
+                    {'Category': 'Leachate — Disposal','Cost': cost_summary.get('LeachateDisposal', 0)},
+                    {'Category': 'Leachate — Trucking','Cost': cost_summary.get('LeachateTrucking', 0)},
+                    {'Category': 'Amendments',         'Cost': cost_summary.get('Amendments', 0)},
+                ]
+                total_cost = cost_summary.get('Total', 0)
+                summary_df_cost = pd.DataFrame(summary_rows)
+                summary_df_cost['% of Total'] = summary_df_cost['Cost'].apply(
+                    lambda x: f"{(x / total_cost * 100):.1f}%" if total_cost > 0 else "0.0%"
+                )
+                summary_df_cost['Cost'] = summary_df_cost['Cost'].apply(lambda x: f"${x:,.2f}")
+                
+                col_a, col_b = st.columns([2, 1])
+                with col_a:
+                    st.dataframe(summary_df_cost, use_container_width=True, hide_index=True)
+                with col_b:
+                    st.metric("Total Project Cost", f"${total_cost:,.2f}")
+                    st.metric("Cost per CY", f"${cost_summary.get('CostPerCY', 0):,.2f}")
+                    st.metric("Project Days", f"{cost_summary.get('ProjectDays', 0)}")
+                
+                # Equipment breakdown by type
+                st.markdown("### Equipment Cost by Type")
+                equip_by_type = cost_summary.get('EquipmentByType', {})
+                if equip_by_type:
+                    equip_rows = [{'Equipment': p, 'Cost': v} for p, v in equip_by_type.items() if v > 0]
+                    if equip_rows:
+                        equip_df = pd.DataFrame(equip_rows)
+                        equip_total = equip_df['Cost'].sum()
+                        equip_df['% of Equipment'] = equip_df['Cost'].apply(
+                            lambda x: f"{(x / equip_total * 100):.1f}%" if equip_total > 0 else "0.0%"
+                        )
+                        equip_df['Cost'] = equip_df['Cost'].apply(lambda x: f"${x:,.2f}")
+                        st.dataframe(equip_df, use_container_width=True, hide_index=True)
+                
+                # Material volumes
+                st.markdown("### Material Volumes & Peak Day")
+                total_water_bbl = cost_summary.get('TotalWaterBBL', 0)
+                total_leachate_bbl = cost_summary.get('TotalLeachateBBL', 0)
+                peak_water = cost_summary.get('PeakWaterBBL_Day', 0)
+                peak_leach = cost_summary.get('PeakLeachateBBL_Day', 0)
+                peak_cells = cost_summary.get('PeakCellsInTreat', 0)
+                
+                mv1, mv2, mv3 = st.columns(3)
+                with mv1:
+                    st.metric("Total Water Used", f"{total_water_bbl:,.0f} BBL", help=f"{total_water_bbl * 42:,.0f} gallons")
+                    st.caption(f"Peak day: {peak_water:,.0f} BBL")
+                with mv2:
+                    st.metric("Total Leachate Disposed", f"{total_leachate_bbl:,.0f} BBL", help=f"{total_leachate_bbl * 42:,.0f} gallons")
+                    st.caption(f"Peak day: {peak_leach:,.0f} BBL")
+                with mv3:
+                    st.metric("Peak Cells in Treat", f"{peak_cells}", help="Maximum concurrent cells in Treat phase — used for sizing water trucking capacity")
+                
+                # Pie chart of cost breakdown
+                st.markdown("### Cost Distribution")
+                pie_data = pd.DataFrame([
+                    {'Category': 'Equipment',           'Cost': cost_summary.get('Equipment', 0)},
+                    {'Category': 'Water Purchase',      'Cost': cost_summary.get('WaterPurchase', 0)},
+                    {'Category': 'Water Trucking',      'Cost': cost_summary.get('WaterTrucking', 0)},
+                    {'Category': 'Leachate Disposal',   'Cost': cost_summary.get('LeachateDisposal', 0)},
+                    {'Category': 'Leachate Trucking',   'Cost': cost_summary.get('LeachateTrucking', 0)},
+                    {'Category': 'Amendments',          'Cost': cost_summary.get('Amendments', 0)},
+                ])
+                pie_data = pie_data[pie_data['Cost'] > 0]
+                if not pie_data.empty:
+                    fig_pie = px.pie(
+                        pie_data,
+                        values='Cost',
+                        names='Category',
+                        color_discrete_sequence=['#8ED973', '#83CCEB', '#5B9BD5', '#FFC000', '#ED7D31', '#F2CEEF']
+                    )
+                    fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                    fig_pie.update_layout(height=400)
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                
+                # Daily cost chart
+                st.markdown("### Daily Costs Over Time")
+                fig_cost = go.Figure()
+                fig_cost.add_trace(go.Bar(
+                    x=daily_costs['Date'], y=daily_costs['ExcavatorCost'],
+                    name='Excavator', marker_color='#8ED973'
+                ))
+                fig_cost.add_trace(go.Bar(
+                    x=daily_costs['Date'], y=daily_costs['LoaderCost'],
+                    name='Loader', marker_color='#5BBF4F'
+                ))
+                fig_cost.add_trace(go.Bar(
+                    x=daily_costs['Date'], y=daily_costs['BulldozerCost'],
+                    name='Bulldozer', marker_color='#2E8B57'
+                ))
+                fig_cost.add_trace(go.Bar(
+                    x=daily_costs['Date'], y=daily_costs['SkidsteerCost'],
+                    name='Skidsteer', marker_color='#90EE90'
+                ))
+                fig_cost.add_trace(go.Bar(
+                    x=daily_costs['Date'], y=daily_costs['WaterPurchaseCost'],
+                    name='Water Purchase', marker_color='#83CCEB'
+                ))
+                fig_cost.add_trace(go.Bar(
+                    x=daily_costs['Date'], y=daily_costs['WaterTruckingCost'],
+                    name='Water Trucking', marker_color='#5B9BD5'
+                ))
+                fig_cost.add_trace(go.Bar(
+                    x=daily_costs['Date'], y=daily_costs['LeachateDisposalCost'],
+                    name='Leachate Disposal', marker_color='#FFC000'
+                ))
+                fig_cost.add_trace(go.Bar(
+                    x=daily_costs['Date'], y=daily_costs['LeachateTruckingCost'],
+                    name='Leachate Trucking', marker_color='#ED7D31'
+                ))
+                fig_cost.add_trace(go.Bar(
+                    x=daily_costs['Date'], y=daily_costs['AmendmentCost'],
+                    name='Amendments', marker_color='#F2CEEF'
+                ))
+                fig_cost.update_layout(
+                    xaxis_title="Date",
+                    yaxis_title="Daily Cost ($)",
+                    barmode='stack',
+                    height=420,
+                    hovermode='x unified',
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.4)
+                )
+                st.plotly_chart(fig_cost, use_container_width=True)
+                
+                # Cumulative cost chart
+                st.markdown("### Cumulative Project Cost")
+                fig_cum = go.Figure()
+                fig_cum.add_trace(go.Scatter(
+                    x=daily_costs['Date'],
+                    y=daily_costs['CumTotalCost'],
+                    name='Cumulative Cost',
+                    line=dict(color='#00B0F0', width=3),
+                    fill='tozeroy',
+                    fillcolor='rgba(0, 176, 240, 0.15)'
+                ))
+                fig_cum.update_layout(
+                    xaxis_title="Date",
+                    yaxis_title="Cumulative Cost ($)",
+                    height=400,
+                    hovermode='x unified',
+                    yaxis_tickformat='$,.0f'
+                )
+                st.plotly_chart(fig_cum, use_container_width=True)
+                
+                # Daily water & leachate volumes
+                st.markdown("### Daily Water & Leachate Volumes")
+                fig_vol = go.Figure()
+                fig_vol.add_trace(go.Bar(
+                    x=daily_costs['Date'], y=daily_costs['WaterBBL'],
+                    name='Water Added (BBL)', marker_color='#5B9BD5'
+                ))
+                fig_vol.add_trace(go.Bar(
+                    x=daily_costs['Date'], y=daily_costs['LeachateBBL'],
+                    name='Leachate Collected (BBL)', marker_color='#ED7D31'
+                ))
+                fig_vol.update_layout(
+                    xaxis_title="Date",
+                    yaxis_title="Volume (BBL)",
+                    barmode='group',
+                    height=380,
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig_vol, use_container_width=True)
+                
+                # Daily costs table
+                st.markdown("### Daily Cost Detail")
+                display_costs = daily_costs.copy()
+                display_costs['Date'] = pd.to_datetime(display_costs['Date']).dt.strftime('%Y-%m-%d')
+                money_cols = ['ExcavatorCost', 'LoaderCost', 'BulldozerCost', 'SkidsteerCost',
+                              'EquipmentCost', 'WaterPurchaseCost', 'WaterTruckingCost', 'WaterCost',
+                              'LeachateDisposalCost', 'LeachateTruckingCost', 'LeachateCost',
+                              'AmendmentCost', 'TotalCost', 'CumTotalCost']
+                for col in money_cols:
+                    if col in display_costs.columns:
+                        display_costs[col] = display_costs[col].apply(lambda x: f"${x:,.2f}")
+                vol_cols = ['WaterBBL', 'LeachateBBL']
+                for col in vol_cols:
+                    if col in display_costs.columns:
+                        display_costs[col] = display_costs[col].apply(lambda x: f"{x:,.1f}")
+                st.dataframe(display_costs, use_container_width=True, height=400, hide_index=True)
+        
+        with tab5:
             st.subheader("Export Data")
             
             # Rebuild full unfiltered schedule to detect idle days for highlighting
@@ -778,43 +1355,177 @@ def main():
             # Filter idle days to exported schedule
             filtered_idle_days = [idx for idx in idle_day_indices if idx in schedule_for_export.index]
             
+            # Get cost data from session state
+            daily_costs_export = st.session_state.get('daily_costs')
+            cost_summary_export = st.session_state.get('cost_summary', {})
+            cost_params_export = st.session_state.get('cost_params', {})
+            
             # Create Excel file with formatting
             output = BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 schedule_for_export.to_excel(writer, sheet_name='Schedule', index=False)
                 activities_df.to_excel(writer, sheet_name='Cell_Activities', index=False)
                 
+                # Costs sheet (daily breakdown)
+                if daily_costs_export is not None and not daily_costs_export.empty:
+                    costs_for_export = daily_costs_export.copy()
+                    costs_for_export.to_excel(writer, sheet_name='Daily_Costs', index=False)
+                
                 # Summary sheet
-                summary_data = {
-                    'Metric': [
-                        'Total Soil (CY)',
-                        'Cell Size (CY)',
-                        'Number of Cells',
-                        'Total Flips',
-                        'Daily Load Capacity (CY)',
-                        'Daily Unload Capacity (CY)',
-                        'Start Date',
-                        'Completion Date',
-                        'Total Days',
-                        'Final CumSoilOut (CY)',
-                        'Idle Capacity Days'
-                    ],
-                    'Value': [
-                        params['TotalSoil_CY'],
-                        params['CellSize_CY'],
-                        params['NumCells'],
-                        total_flips,
-                        params['DailyLoad_CY'],
-                        params['DailyUnload_CY'],
-                        params['StartDate'].strftime('%Y-%m-%d'),
-                        completion_date.strftime('%Y-%m-%d') if completion_date else 'N/A',
-                        total_days,
-                        schedule_for_export['CumSoilOut'].max(),
-                        len(filtered_idle_days)
-                    ]
-                }
+                equip_by_type_exp = cost_summary_export.get('EquipmentByType', {})
+                summary_metrics = [
+                    'Total Soil (CY)',
+                    'Cell Size (CY)',
+                    'Number of Cells',
+                    'Total Flips',
+                    'Daily Soil Capacity (CY) [derived]',
+                    'Bottleneck',
+                    'Start Date',
+                    'Completion Date',
+                    'Total Days',
+                    'Final CumSoilOut (CY)',
+                    'Idle Capacity Days',
+                    '',
+                    '--- MATERIAL VOLUMES ---',
+                    'Total Water Used (BBL)',
+                    'Total Leachate Disposed (BBL)',
+                    'Peak Water Day (BBL)',
+                    'Peak Leachate Day (BBL)',
+                    'Peak Cells in Treat',
+                    '',
+                    '--- COST SUMMARY ---',
+                    'Equipment Cost ($)',
+                    'Water Purchase Cost ($)',
+                    'Water Trucking Cost ($)',
+                    'Water — Total ($)',
+                    'Leachate Disposal Cost ($)',
+                    'Leachate Trucking Cost ($)',
+                    'Leachate — Total ($)',
+                    'Amendment Cost ($)',
+                    'TOTAL PROJECT COST ($)',
+                    'Cost per CY ($/CY)',
+                    '',
+                    '--- EQUIPMENT BY TYPE ---',
+                    'Excavator ($)',
+                    'Loader ($)',
+                    'Bulldozer ($)',
+                    'Skidsteer ($)',
+                ]
+                summary_values = [
+                    params['TotalSoil_CY'],
+                    params['CellSize_CY'],
+                    params['NumCells'],
+                    total_flips,
+                    params['DailyLoad_CY'],
+                    cost_params_export.get('bottleneck', 'N/A'),
+                    params['StartDate'].strftime('%Y-%m-%d'),
+                    completion_date.strftime('%Y-%m-%d') if completion_date else 'N/A',
+                    total_days,
+                    schedule_for_export['CumSoilOut'].max(),
+                    len(filtered_idle_days),
+                    '',
+                    '',
+                    round(cost_summary_export.get('TotalWaterBBL', 0), 2),
+                    round(cost_summary_export.get('TotalLeachateBBL', 0), 2),
+                    round(cost_summary_export.get('PeakWaterBBL_Day', 0), 2),
+                    round(cost_summary_export.get('PeakLeachateBBL_Day', 0), 2),
+                    cost_summary_export.get('PeakCellsInTreat', 0),
+                    '',
+                    '',
+                    round(cost_summary_export.get('Equipment', 0), 2),
+                    round(cost_summary_export.get('WaterPurchase', 0), 2),
+                    round(cost_summary_export.get('WaterTrucking', 0), 2),
+                    round(cost_summary_export.get('Water', 0), 2),
+                    round(cost_summary_export.get('LeachateDisposal', 0), 2),
+                    round(cost_summary_export.get('LeachateTrucking', 0), 2),
+                    round(cost_summary_export.get('Leachate', 0), 2),
+                    round(cost_summary_export.get('Amendments', 0), 2),
+                    round(cost_summary_export.get('Total', 0), 2),
+                    round(cost_summary_export.get('CostPerCY', 0), 2),
+                    '',
+                    '',
+                    round(equip_by_type_exp.get('Excavator', 0), 2),
+                    round(equip_by_type_exp.get('Loader', 0), 2),
+                    round(equip_by_type_exp.get('Bulldozer', 0), 2),
+                    round(equip_by_type_exp.get('Skidsteer', 0), 2),
+                ]
+                summary_data = {'Metric': summary_metrics, 'Value': summary_values}
                 summary_df = pd.DataFrame(summary_data)
                 summary_df.to_excel(writer, sheet_name='Summary', index=False)
+                
+                # Cost Inputs sheet (record the rates used)
+                cost_inputs_data = {
+                    'Parameter': [
+                        '--- EQUIPMENT FLEET ---',
+                        '# Excavators',
+                        'Excavator capacity (CY/day each)',
+                        'Excavator $/day each',
+                        '# Loaders',
+                        'Loader capacity (CY/day each)',
+                        'Loader $/day each',
+                        '# Bulldozers',
+                        'Bulldozer $/day each',
+                        '# Skidsteers',
+                        'Skidsteer $/day each',
+                        'Derived daily soil capacity (CY)',
+                        'Bottleneck equipment',
+                        '',
+                        '--- WATER ---',
+                        'Water usage (BBL/CY total)',
+                        'Water cost ($/BBL)',
+                        'Water truck capacity (BBL)',
+                        'Water truck trip time (hr)',
+                        'Water truck $/hr',
+                        '',
+                        '--- LEACHATE ---',
+                        'Leachate collection (% of water)',
+                        'Leachate volume (BBL/CY) [derived]',
+                        'Leachate lag (days after water)',
+                        'Leachate disposal ($/BBL)',
+                        'Leachate truck capacity (BBL)',
+                        'Leachate truck trip time (hr)',
+                        'Leachate truck $/hr',
+                        '',
+                        '--- AMENDMENTS ---',
+                        'Amendment cost ($/CY)',
+                    ],
+                    'Value': [
+                        '',
+                        cost_params_export.get('n_excavator', 0),
+                        cost_params_export.get('excavator_capacity', 0),
+                        cost_params_export.get('excavator_daily', 0),
+                        cost_params_export.get('n_loader', 0),
+                        cost_params_export.get('loader_capacity', 0),
+                        cost_params_export.get('loader_daily', 0),
+                        cost_params_export.get('n_bulldozer', 0),
+                        cost_params_export.get('bulldozer_daily', 0),
+                        cost_params_export.get('n_skidsteer', 0),
+                        cost_params_export.get('skidsteer_daily', 0),
+                        cost_params_export.get('effective_daily_capacity', 0),
+                        cost_params_export.get('bottleneck', 'N/A'),
+                        '',
+                        '',
+                        cost_params_export.get('water_bbl_per_cy', 0),
+                        cost_params_export.get('water_cost_per_bbl', 0),
+                        cost_params_export.get('water_truck_capacity', 0),
+                        cost_params_export.get('water_truck_trip_hr', 0),
+                        cost_params_export.get('water_truck_hourly', 0),
+                        '',
+                        '',
+                        cost_params_export.get('leachate_pct_of_water', 0),
+                        round(cost_params_export.get('leachate_bbl_per_cy', 0), 4),
+                        cost_params_export.get('leachate_lag_days', 0),
+                        cost_params_export.get('leachate_cost_per_bbl', 0),
+                        cost_params_export.get('leachate_truck_capacity', 0),
+                        cost_params_export.get('leachate_truck_trip_hr', 0),
+                        cost_params_export.get('leachate_truck_hourly', 0),
+                        '',
+                        '',
+                        cost_params_export.get('amendment_cost_per_cy', 0),
+                    ]
+                }
+                cost_inputs_df = pd.DataFrame(cost_inputs_data)
+                cost_inputs_df.to_excel(writer, sheet_name='Cost_Inputs', index=False)
                 
                 # Apply formatting to Schedule sheet
                 workbook = writer.book
@@ -911,7 +1622,7 @@ def main():
             num_cells = int(params['NumCells'])
             cell_size = int(params['CellSize_CY'])
             capacity = int(params['DailyLoad_CY'])
-            excel_filename = f"{timestamp}_{num_cells}_{cell_size}_{capacity}.xlsx"
+            excel_filename = f"v{APP_VERSION}_{timestamp}_{num_cells}_{cell_size}_{capacity}.xlsx"
             
             st.download_button(
                 label="📥 Download Excel Report",
@@ -921,14 +1632,14 @@ def main():
             )
             
             # CSV downloads
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
             
             with col1:
                 csv_schedule = schedule.to_csv(index=False)
                 st.download_button(
                     label="📄 Download Schedule (CSV)",
                     data=csv_schedule,
-                    file_name=f"schedule_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"v{APP_VERSION}_schedule_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv"
                 )
             
@@ -937,9 +1648,20 @@ def main():
                 st.download_button(
                     label="📄 Download Activities (CSV)",
                     data=csv_activities,
-                    file_name=f"activities_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"v{APP_VERSION}_activities_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv"
                 )
+            
+            with col3:
+                daily_costs_csv_data = st.session_state.get('daily_costs')
+                if daily_costs_csv_data is not None and not daily_costs_csv_data.empty:
+                    csv_costs = daily_costs_csv_data.to_csv(index=False)
+                    st.download_button(
+                        label="📄 Download Costs (CSV)",
+                        data=csv_costs,
+                        file_name=f"v{APP_VERSION}_daily_costs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime="text/csv"
+                    )
     
     else:
         st.info("👈 Configure parameters in the sidebar and click **Run Simulation** to start")
