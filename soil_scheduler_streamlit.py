@@ -3,8 +3,6 @@ Soil Remediation Scheduler - Streamlit Interactive App
 Interactive web app for multi-phase soil remediation with capacity pooling
 """
 
-APP_VERSION = "2.00"
-
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
@@ -708,7 +706,7 @@ def calculate_costs(activities, schedule, params, cost_params, phases_df):
 # ============================================================================
 
 def main():
-    st.set_page_config(page_title=f"Soil Remediation Scheduler v{APP_VERSION}", layout="wide")
+    st.set_page_config(page_title="Soil Remediation Scheduler", layout="wide")
     
     # Display company logo
     col1, col2, col3 = st.columns([1, 2, 1])
@@ -716,7 +714,7 @@ def main():
         st.image("Clean_Futures_2.png", use_container_width=True)
     
     st.title("🏗️ Soil Remediation Scheduler")
-    st.markdown(f"**Interactive multi-phase soil remediation simulator with capacity pooling** &nbsp; · &nbsp; `v{APP_VERSION}`")
+    st.markdown("**Interactive multi-phase soil remediation simulator with capacity pooling**")
     
     # Sidebar for parameters
     st.sidebar.header("📋 Project Parameters")
@@ -1596,7 +1594,7 @@ def main():
             num_cells = int(params['NumCells'])
             cell_size = int(params['CellSize_CY'])
             capacity = int(params['DailyLoad_CY'])
-            excel_filename = f"v{APP_VERSION}_{timestamp}_{num_cells}_{cell_size}_{capacity}.xlsx"
+            excel_filename = f"{timestamp}_{num_cells}_{cell_size}_{capacity}.xlsx"
             
             st.download_button(
                 label="📥 Download Excel Report",
@@ -1613,7 +1611,7 @@ def main():
                 st.download_button(
                     label="📄 Download Schedule (CSV)",
                     data=csv_schedule,
-                    file_name=f"v{APP_VERSION}_schedule_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"schedule_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv"
                 )
             
@@ -1622,7 +1620,7 @@ def main():
                 st.download_button(
                     label="📄 Download Activities (CSV)",
                     data=csv_activities,
-                    file_name=f"v{APP_VERSION}_activities_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    file_name=f"activities_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                     mime="text/csv"
                 )
             
@@ -1633,7 +1631,7 @@ def main():
                     st.download_button(
                         label="📄 Download Costs (CSV)",
                         data=csv_costs,
-                        file_name=f"v{APP_VERSION}_daily_costs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        file_name=f"daily_costs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                         mime="text/csv"
                     )
     
