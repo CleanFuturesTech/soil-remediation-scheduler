@@ -3,7 +3,7 @@ Soil Remediation Scheduler - Streamlit Interactive App
 Interactive web app for multi-phase soil remediation with capacity pooling
 """
 
-APP_VERSION = "2.04"
+APP_VERSION = "2.05"
 
 import streamlit as st
 import pandas as pd
@@ -612,11 +612,21 @@ def calculate_costs(activities, schedule, params, cost_params, phases_df):
     # ---------- Initialize daily cost dataframe ----------
     daily_costs = pd.DataFrame({
         'Date': schedule['Date'].values,
+        'ExcavatorEquipCost': 0.0,
+        'ExcavatorOperatorCost': 0.0,
         'ExcavatorCost': 0.0,
+        'LoaderEquipCost': 0.0,
+        'LoaderOperatorCost': 0.0,
         'LoaderCost': 0.0,
+        'BulldozerEquipCost': 0.0,
+        'BulldozerOperatorCost': 0.0,
         'BulldozerCost': 0.0,
+        'SkidsteerEquipCost': 0.0,
+        'SkidsteerOperatorCost': 0.0,
         'SkidsteerCost': 0.0,
-        'EquipmentCost': 0.0,
+        'EquipmentRentalCost': 0.0,
+        'OperatorLaborCost': 0.0,
+        'EquipmentCost': 0.0,        # combined (equipment + operator) — kept for back-compat
         'CellsInTreat': 0,
         'CellsInDry': 0,
         'WaterBBL': 0.0,
@@ -631,19 +641,45 @@ def calculate_costs(activities, schedule, params, cost_params, phases_df):
     })
     daily_costs = daily_costs.set_index('Date')
     
-    # ---------- Equipment costs (daily fleet rental for every day in schedule) ----------
-    daily_excavator = cost_params.get('n_excavator', 0) * cost_params.get('excavator_daily', 0.0)
-    daily_loader    = cost_params.get('n_loader', 0)    * cost_params.get('loader_daily', 0.0)
-    daily_bulldozer = cost_params.get('n_bulldozer', 0) * cost_params.get('bulldozer_daily', 0.0)
-    daily_skidsteer = cost_params.get('n_skidsteer', 0) * cost_params.get('skidsteer_daily', 0.0)
-    daily_fleet_cost = daily_excavator + daily_loader + daily_bulldozer + daily_skidsteer
+    # ---------- Equipment costs (daily fleet rental + operator labor) ----------
+    # Per equipment type: daily_equip = n × equip_daily, daily_op = n × op_daily (already zero if self-operated)
+    eq_types = [
+        ('Excavator', 'excavator'),
+        ('Loader',    'loader'),
+        ('Bulldozer', 'bulldozer'),
+        ('Skidsteer', 'skidsteer'),
+    ]
+    
+    equip_rental_totals = {}   # type_label -> daily equipment rental
+    operator_totals     = {}   # type_label -> daily operator labor
+    
+    for label, prefix in eq_types:
+        n = cost_params.get(f'n_{prefix}', 0)
+        eq_daily = n * cost_params.get(f'{prefix}_equip_daily', 0.0)
+        op_daily = n * cost_params.get(f'{prefix}_op_daily', 0.0)
+        equip_rental_totals[label] = eq_daily
+        operator_totals[label]     = op_daily
+    
+    daily_equipment_rental = sum(equip_rental_totals.values())
+    daily_operator_labor   = sum(operator_totals.values())
+    daily_fleet_cost       = daily_equipment_rental + daily_operator_labor
     
     for date in daily_costs.index:
-        daily_costs.at[date, 'ExcavatorCost'] = daily_excavator
-        daily_costs.at[date, 'LoaderCost']    = daily_loader
-        daily_costs.at[date, 'BulldozerCost'] = daily_bulldozer
-        daily_costs.at[date, 'SkidsteerCost'] = daily_skidsteer
-        daily_costs.at[date, 'EquipmentCost'] = daily_fleet_cost
+        daily_costs.at[date, 'ExcavatorEquipCost']    = equip_rental_totals['Excavator']
+        daily_costs.at[date, 'ExcavatorOperatorCost'] = operator_totals['Excavator']
+        daily_costs.at[date, 'ExcavatorCost']         = equip_rental_totals['Excavator'] + operator_totals['Excavator']
+        daily_costs.at[date, 'LoaderEquipCost']       = equip_rental_totals['Loader']
+        daily_costs.at[date, 'LoaderOperatorCost']    = operator_totals['Loader']
+        daily_costs.at[date, 'LoaderCost']            = equip_rental_totals['Loader'] + operator_totals['Loader']
+        daily_costs.at[date, 'BulldozerEquipCost']    = equip_rental_totals['Bulldozer']
+        daily_costs.at[date, 'BulldozerOperatorCost'] = operator_totals['Bulldozer']
+        daily_costs.at[date, 'BulldozerCost']         = equip_rental_totals['Bulldozer'] + operator_totals['Bulldozer']
+        daily_costs.at[date, 'SkidsteerEquipCost']    = equip_rental_totals['Skidsteer']
+        daily_costs.at[date, 'SkidsteerOperatorCost'] = operator_totals['Skidsteer']
+        daily_costs.at[date, 'SkidsteerCost']         = equip_rental_totals['Skidsteer'] + operator_totals['Skidsteer']
+        daily_costs.at[date, 'EquipmentRentalCost']   = daily_equipment_rental
+        daily_costs.at[date, 'OperatorLaborCost']     = daily_operator_labor
+        daily_costs.at[date, 'EquipmentCost']         = daily_fleet_cost
     
     # ---------- Rate constants ----------
     water_bbl_per_cy   = cost_params.get('water_bbl_per_cy', 0.0)
@@ -724,7 +760,9 @@ def calculate_costs(activities, schedule, params, cost_params, phases_df):
     project_days = len(daily_costs)
     
     summary = {
-        'Equipment': daily_costs['EquipmentCost'].sum(),
+        'Equipment':        daily_costs['EquipmentCost'].sum(),         # combined (equipment + operator)
+        'EquipmentRental':  daily_costs['EquipmentRentalCost'].sum(),
+        'OperatorLabor':    daily_costs['OperatorLaborCost'].sum(),
         'WaterPurchase':    daily_costs['WaterPurchaseCost'].sum(),
         'WaterTrucking':    daily_costs['WaterTruckingCost'].sum(),
         'Water':            daily_costs['WaterCost'].sum(),
@@ -739,12 +777,26 @@ def calculate_costs(activities, schedule, params, cost_params, phases_df):
     summary['CostPerCY'] = summary['Total'] / total_cy if total_cy > 0 else 0.0
     summary['ProjectDays'] = project_days
     
-    # Equipment breakdown by type
+    # Equipment breakdown by type (combined equip + operator)
     summary['EquipmentByType'] = {
         'Excavator': daily_costs['ExcavatorCost'].sum(),
         'Loader':    daily_costs['LoaderCost'].sum(),
         'Bulldozer': daily_costs['BulldozerCost'].sum(),
         'Skidsteer': daily_costs['SkidsteerCost'].sum(),
+    }
+    
+    # Equipment rental vs operator labor breakdown by type
+    summary['EquipmentRentalByType'] = {
+        'Excavator': daily_costs['ExcavatorEquipCost'].sum(),
+        'Loader':    daily_costs['LoaderEquipCost'].sum(),
+        'Bulldozer': daily_costs['BulldozerEquipCost'].sum(),
+        'Skidsteer': daily_costs['SkidsteerEquipCost'].sum(),
+    }
+    summary['OperatorLaborByType'] = {
+        'Excavator': daily_costs['ExcavatorOperatorCost'].sum(),
+        'Loader':    daily_costs['LoaderOperatorCost'].sum(),
+        'Bulldozer': daily_costs['BulldozerOperatorCost'].sum(),
+        'Skidsteer': daily_costs['SkidsteerOperatorCost'].sum(),
     }
     
     # Material volumes
@@ -849,16 +901,65 @@ def build_formula_excel(schedule_for_export, activities_df, params, cost_params,
         
         add_section('')
         add_section('EQUIPMENT')
-        add_input('n_excavator', '# Excavators',       cost_params.get('n_excavator', 0))
-        add_input('exc_daily',   'Excavator $/day',    cost_params.get('excavator_daily', 0))
-        add_input('n_loader',    '# Loaders',          cost_params.get('n_loader', 0))
-        add_input('load_daily',  'Loader $/day',       cost_params.get('loader_daily', 0))
-        add_input('n_bulldozer', '# Bulldozers',       cost_params.get('n_bulldozer', 0))
-        add_input('bull_daily',  'Bulldozer $/day',    cost_params.get('bulldozer_daily', 0))
-        add_input('n_skidsteer', '# Skidsteers',       cost_params.get('n_skidsteer', 0))
-        add_input('skid_daily',  'Skidsteer $/day',    cost_params.get('skidsteer_daily', 0))
+        # Workday hours — needed for hourly-rate conversion
+        add_input('workday_hours', 'Workday hours (for hourly rates)', cost_params.get('workday_hours', 8.0))
+        
+        # Helper: emit a per-type block of inputs and derived formulas
+        # Each type has 9 rows: # units, equip rate, equip period, equip daily (formula),
+        #   op rate, op period, op daily (formula), self-operate flag, total daily (formula)
+        def _add_equipment_block(label, prefix):
+            n_key      = f'n_{prefix}'
+            er_key     = f'{prefix}_equip_rate'
+            ep_key     = f'{prefix}_equip_period'
+            ed_key     = f'{prefix}_equip_daily'
+            or_key     = f'{prefix}_op_rate'
+            op_key     = f'{prefix}_op_period'
+            od_key     = f'{prefix}_op_daily'
+            so_key     = f'{prefix}_self_op'
+            tot_key    = f'{prefix}_total_daily'
+            
+            add_input(n_key,  f'# {label}s',                          cost_params.get(f'n_{prefix}', 0))
+            add_input(er_key, f'{label} equipment rate ($)',          cost_params.get(f'{prefix}_equip_rate', 0))
+            add_input(ep_key, f'{label} equipment period',            cost_params.get(f'{prefix}_equip_period', 'Daily'),
+                      'Hourly/Daily/Weekly/Monthly')
+            # Daily-equivalent formula: IF(period="Hourly", rate*hours, IF("Daily", rate, IF("Weekly", rate/7, rate/30)))
+            add_input(ed_key, f'{label} equipment $/day [derived]',
+                      f'=IF({INPUTS[ep_key]}="Hourly",{INPUTS[er_key]}*{INPUTS["workday_hours"]},'
+                      f'IF({INPUTS[ep_key]}="Daily",{INPUTS[er_key]},'
+                      f'IF({INPUTS[ep_key]}="Weekly",{INPUTS[er_key]}/7,{INPUTS[er_key]}/30)))')
+            add_input(or_key, f'{label} operator rate ($)',           cost_params.get(f'{prefix}_op_rate', 0))
+            add_input(op_key, f'{label} operator period',             cost_params.get(f'{prefix}_op_period', 'Daily'),
+                      'Hourly/Daily/Weekly/Monthly')
+            add_input(od_key, f'{label} operator $/day [derived]',
+                      f'=IF({INPUTS[op_key]}="Hourly",{INPUTS[or_key]}*{INPUTS["workday_hours"]},'
+                      f'IF({INPUTS[op_key]}="Daily",{INPUTS[or_key]},'
+                      f'IF({INPUTS[op_key]}="Weekly",{INPUTS[or_key]}/7,{INPUTS[or_key]}/30)))')
+            add_input(so_key, f'{label} self-operated',
+                      'TRUE' if cost_params.get(f'{prefix}_self_op', False) else 'FALSE',
+                      'TRUE = no operator cost')
+            # Total daily per unit = equipment_daily + (self_op ? 0 : operator_daily)
+            add_input(tot_key, f'{label} total $/day/unit [derived]',
+                      f'=IF({INPUTS[so_key]}="TRUE",{INPUTS[ed_key]},{INPUTS[ed_key]}+{INPUTS[od_key]})')
+        
+        _add_equipment_block('Excavator', 'excavator')
+        _add_equipment_block('Loader',    'loader')
+        _add_equipment_block('Bulldozer', 'bulldozer')
+        _add_equipment_block('Skidsteer', 'skidsteer')
+        
+        # Fleet totals: equipment rental, operator labor, combined
+        add_input('daily_equip_rental_total', 'Daily equipment rental ($) [derived]',
+                  f'={INPUTS["n_excavator"]}*{INPUTS["excavator_equip_daily"]}'
+                  f'+{INPUTS["n_loader"]}*{INPUTS["loader_equip_daily"]}'
+                  f'+{INPUTS["n_bulldozer"]}*{INPUTS["bulldozer_equip_daily"]}'
+                  f'+{INPUTS["n_skidsteer"]}*{INPUTS["skidsteer_equip_daily"]}')
+        add_input('daily_operator_total', 'Daily operator labor ($) [derived]',
+                  # Each type contributes 0 if self-operated, else N × op_daily
+                  f'=IF({INPUTS["excavator_self_op"]}="TRUE",0,{INPUTS["n_excavator"]}*{INPUTS["excavator_op_daily"]})'
+                  f'+IF({INPUTS["loader_self_op"]}="TRUE",0,{INPUTS["n_loader"]}*{INPUTS["loader_op_daily"]})'
+                  f'+IF({INPUTS["bulldozer_self_op"]}="TRUE",0,{INPUTS["n_bulldozer"]}*{INPUTS["bulldozer_op_daily"]})'
+                  f'+IF({INPUTS["skidsteer_self_op"]}="TRUE",0,{INPUTS["n_skidsteer"]}*{INPUTS["skidsteer_op_daily"]})')
         add_input('daily_equip_total', 'Daily fleet cost ($) [derived]',
-                  f"={INPUTS['n_excavator']}*{INPUTS['exc_daily']}+{INPUTS['n_loader']}*{INPUTS['load_daily']}+{INPUTS['n_bulldozer']}*{INPUTS['bull_daily']}+{INPUTS['n_skidsteer']}*{INPUTS['skid_daily']}")
+                  f'={INPUTS["daily_equip_rental_total"]}+{INPUTS["daily_operator_total"]}')
         
         # Create the Inputs sheet at position 0 (first tab)
         inputs_ws = workbook.create_sheet('Inputs', 0)
@@ -1001,7 +1102,9 @@ def build_formula_excel(schedule_for_export, activities_df, params, cost_params,
             ('Total Leachate Disposed (BBL)',f"=SUM({sched_leach_bbl_range})" if sched_leach_bbl_range else 0),
             ('', ''),
             ('COST SUMMARY',         ''),
-            ('Equipment Cost ($)',           f"={INPUTS['daily_equip_total']}*{project_days_formula}"),
+            ('Equipment Rental ($)',         f"={INPUTS['daily_equip_rental_total']}*{project_days_formula}"),
+            ('Operator Labor ($)',           f"={INPUTS['daily_operator_total']}*{project_days_formula}"),
+            ('Equipment + Operators ($)',    None),   # filled below
             ('Water Purchase Cost ($)',      f"=SUM({sched_water_cost_range})"  if sched_water_cost_range  else 0),
             ('Water Trucking Cost ($)',      f"=SUM({sched_water_truck_range})" if sched_water_truck_range else 0),
             ('Water — Total ($)',            None),   # filled below
@@ -1012,17 +1115,30 @@ def build_formula_excel(schedule_for_export, activities_df, params, cost_params,
             ('TOTAL PROJECT COST ($)',       None),   # filled below
             ('Cost per CY ($/CY)',           None),   # filled below
             ('', ''),
-            ('EQUIPMENT BY TYPE',    ''),
-            ('Excavator ($)',                f"={INPUTS['n_excavator']}*{INPUTS['exc_daily']}*{project_days_formula}"),
-            ('Loader ($)',                   f"={INPUTS['n_loader']}*{INPUTS['load_daily']}*{project_days_formula}"),
-            ('Bulldozer ($)',                f"={INPUTS['n_bulldozer']}*{INPUTS['bull_daily']}*{project_days_formula}"),
-            ('Skidsteer ($)',                f"={INPUTS['n_skidsteer']}*{INPUTS['skid_daily']}*{project_days_formula}"),
+            ('EQUIPMENT RENTAL BY TYPE',    ''),
+            ('Excavator equipment ($)',      f"={INPUTS['n_excavator']}*{INPUTS['excavator_equip_daily']}*{project_days_formula}"),
+            ('Loader equipment ($)',         f"={INPUTS['n_loader']}*{INPUTS['loader_equip_daily']}*{project_days_formula}"),
+            ('Bulldozer equipment ($)',      f"={INPUTS['n_bulldozer']}*{INPUTS['bulldozer_equip_daily']}*{project_days_formula}"),
+            ('Skidsteer equipment ($)',      f"={INPUTS['n_skidsteer']}*{INPUTS['skidsteer_equip_daily']}*{project_days_formula}"),
+            ('', ''),
+            ('OPERATOR LABOR BY TYPE',      ''),
+            ('Excavator operator ($)',
+                f'=IF({INPUTS["excavator_self_op"]}="TRUE",0,{INPUTS["n_excavator"]}*{INPUTS["excavator_op_daily"]}*{project_days_formula})'),
+            ('Loader operator ($)',
+                f'=IF({INPUTS["loader_self_op"]}="TRUE",0,{INPUTS["n_loader"]}*{INPUTS["loader_op_daily"]}*{project_days_formula})'),
+            ('Bulldozer operator ($)',
+                f'=IF({INPUTS["bulldozer_self_op"]}="TRUE",0,{INPUTS["n_bulldozer"]}*{INPUTS["bulldozer_op_daily"]}*{project_days_formula})'),
+            ('Skidsteer operator ($)',
+                f'=IF({INPUTS["skidsteer_self_op"]}="TRUE",0,{INPUTS["n_skidsteer"]}*{INPUTS["skidsteer_op_daily"]}*{project_days_formula})'),
         ]
         
         # First pass: write everything except None placeholders
         for i, (label, val) in enumerate(summary_rows, start=2):
             a_cell = summary_ws.cell(row=i, column=1, value=label)
-            a_cell.font = Font(name='Aptos Narrow', size=10, bold=label in ('MATERIAL VOLUMES', 'COST SUMMARY', 'EQUIPMENT BY TYPE', 'TOTAL PROJECT COST ($)'))
+            a_cell.font = Font(name='Aptos Narrow', size=10,
+                               bold=label in ('MATERIAL VOLUMES', 'COST SUMMARY',
+                                              'EQUIPMENT RENTAL BY TYPE', 'OPERATOR LABOR BY TYPE',
+                                              'TOTAL PROJECT COST ($)'))
             if val is not None:
                 b_cell = summary_ws.cell(row=i, column=2, value=val)
                 b_cell.font = Font(name='Aptos Narrow', size=10)
@@ -1043,10 +1159,12 @@ def build_formula_excel(schedule_for_export, activities_df, params, cost_params,
         
         set_summary('Water — Total ($)',
                     f"=B{label_to_row['Water Purchase Cost ($)']}+B{label_to_row['Water Trucking Cost ($)']}")
+        set_summary('Equipment + Operators ($)',
+                    f"=B{label_to_row['Equipment Rental ($)']}+B{label_to_row['Operator Labor ($)']}")
         set_summary('Leachate — Total ($)',
                     f"=B{label_to_row['Leachate Disposal Cost ($)']}+B{label_to_row['Leachate Trucking Cost ($)']}")
         set_summary('TOTAL PROJECT COST ($)',
-                    f"=B{label_to_row['Equipment Cost ($)']}+B{label_to_row['Water — Total ($)']}+B{label_to_row['Leachate — Total ($)']}+B{label_to_row['Amendment Cost ($)']}")
+                    f"=B{label_to_row['Equipment + Operators ($)']}+B{label_to_row['Water — Total ($)']}+B{label_to_row['Leachate — Total ($)']}+B{label_to_row['Amendment Cost ($)']}")
         set_summary('Cost per CY ($/CY)',
                     f"=B{label_to_row['TOTAL PROJECT COST ($)']}/B{label_to_row['Total Soil (CY)']}",
                     fmt='"$"#,##0.00')
@@ -1240,24 +1358,118 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.header("🚜 Equipment Fleet")
     
-    with st.sidebar.expander("Excavator (excavates soil, gates load/unload)", expanded=True):
-        n_excavator = st.number_input("# Excavators", min_value=1, max_value=10, value=1, step=1, key='n_excavator')
-        excavator_capacity = st.number_input("CY/day per excavator", min_value=50, max_value=5000, value=750, step=50, key='excavator_capacity')
-        excavator_daily = st.number_input("$/day per excavator", min_value=0.0, value=800.0, step=50.0, key='excavator_daily')
+    # Project-level workday hours (used for hourly-rate conversion)
+    workday_hours = st.sidebar.number_input(
+        "Workday hours (for hourly rates)",
+        min_value=1.0, max_value=24.0, value=8.0, step=0.5,
+        key='workday_hours',
+        help="Used to convert hourly equipment/operator rates into daily-equivalent costs."
+    )
     
-    with st.sidebar.expander("Rubber Tire Loader (moves piles)", expanded=True):
-        n_loader = st.number_input("# Loaders", min_value=1, max_value=10, value=1, step=1, key='n_loader')
-        loader_capacity = st.number_input("CY/day per loader", min_value=50, max_value=5000, value=750, step=50, key='loader_capacity')
-        loader_daily = st.number_input("$/day per loader", min_value=0.0, value=600.0, step=50.0, key='loader_daily')
+    PERIOD_OPTIONS = ["Hourly", "Daily", "Weekly", "Monthly"]
     
-    with st.sidebar.expander("Bulldozer (levels for treat, rips cells)", expanded=False):
-        n_bulldozer = st.number_input("# Bulldozers", min_value=0, max_value=10, value=1, step=1, key='n_bulldozer')
-        bulldozer_daily = st.number_input("$/day per bulldozer", min_value=0.0, value=900.0, step=50.0, key='bulldozer_daily')
-        st.caption("Bulldozer is on site daily; doesn't gate soil throughput.")
+    def _period_to_daily(rate, period, hours_per_day):
+        """Convert a rate at any billing period into a daily-equivalent."""
+        if period == "Hourly":  return rate * hours_per_day
+        if period == "Daily":   return rate
+        if period == "Weekly":  return rate / 7.0
+        if period == "Monthly": return rate / 30.0
+        return rate
     
-    with st.sidebar.expander("Skidsteer (on site, not in soil processing)", expanded=False):
-        n_skidsteer = st.number_input("# Skidsteers", min_value=0, max_value=10, value=1, step=1, key='n_skidsteer')
-        skidsteer_daily = st.number_input("$/day per skidsteer", min_value=0.0, value=300.0, step=25.0, key='skidsteer_daily')
+    def _equipment_inputs(label, key_prefix, default_units, default_equip_rate,
+                          default_op_rate, default_capacity=None,
+                          units_min=0, expanded=False, caption=None):
+        """Render one equipment type's inputs and return a dict of values."""
+        with st.sidebar.expander(label, expanded=expanded):
+            n = st.number_input("# Units", min_value=units_min, max_value=20,
+                                value=default_units, step=1, key=f'{key_prefix}_n')
+            
+            if default_capacity is not None:
+                capacity = st.number_input("CY/day per unit", min_value=50, max_value=5000,
+                                           value=default_capacity, step=50, key=f'{key_prefix}_capacity')
+            else:
+                capacity = 0
+            
+            st.markdown("**Equipment Rental**")
+            c1, c2 = st.columns([2, 2])
+            with c1:
+                equip_rate = st.number_input("Rate ($)", min_value=0.0, value=default_equip_rate,
+                                             step=25.0, key=f'{key_prefix}_equip_rate')
+            with c2:
+                equip_period = st.selectbox("Per", PERIOD_OPTIONS, index=1, key=f'{key_prefix}_equip_period')
+            
+            st.markdown("**Operator**")
+            self_operated = st.toggle("Self-operate (no operator cost)", value=False,
+                                       key=f'{key_prefix}_self_op',
+                                       help="If enabled, no operator cost is charged for this equipment.")
+            if self_operated:
+                op_rate = 0.0
+                op_period = "Daily"
+                st.caption("✅ Self-operated: $0 operator cost.")
+            else:
+                c3, c4 = st.columns([2, 2])
+                with c3:
+                    op_rate = st.number_input("Operator rate ($)", min_value=0.0, value=default_op_rate,
+                                              step=25.0, key=f'{key_prefix}_op_rate')
+                with c4:
+                    op_period = st.selectbox("Per ", PERIOD_OPTIONS, index=1, key=f'{key_prefix}_op_period')
+            
+            equip_daily = _period_to_daily(equip_rate, equip_period, workday_hours)
+            op_daily = _period_to_daily(op_rate, op_period, workday_hours) if not self_operated else 0.0
+            unit_daily = equip_daily + op_daily
+            
+            st.caption(f"Daily-equivalent: equipment ${equip_daily:,.2f} + operator ${op_daily:,.2f} = **${unit_daily:,.2f}/unit/day**  \n"
+                       f"Fleet: ${unit_daily * n:,.2f}/day for {n} unit{'s' if n != 1 else ''}")
+            if caption:
+                st.caption(caption)
+        
+        return {
+            'n': n, 'capacity': capacity,
+            'equip_rate': equip_rate, 'equip_period': equip_period,
+            'op_rate': op_rate, 'op_period': op_period,
+            'self_operated': self_operated,
+            'equip_daily': equip_daily, 'op_daily': op_daily,
+            'unit_daily': unit_daily,
+        }
+    
+    exc = _equipment_inputs(
+        "Excavator (excavates soil, gates load/unload)",
+        key_prefix='excavator',
+        default_units=1, default_equip_rate=500.0, default_op_rate=300.0,
+        default_capacity=750, units_min=1, expanded=True
+    )
+    n_excavator        = exc['n']
+    excavator_capacity = exc['capacity']
+    excavator_daily    = exc['unit_daily']     # combined equip + operator
+    
+    load = _equipment_inputs(
+        "Rubber Tire Loader (moves piles)",
+        key_prefix='loader',
+        default_units=1, default_equip_rate=400.0, default_op_rate=200.0,
+        default_capacity=750, units_min=1, expanded=True
+    )
+    n_loader        = load['n']
+    loader_capacity = load['capacity']
+    loader_daily    = load['unit_daily']
+    
+    bull = _equipment_inputs(
+        "Bulldozer (levels for treat, rips cells)",
+        key_prefix='bulldozer',
+        default_units=1, default_equip_rate=600.0, default_op_rate=300.0,
+        units_min=0,
+        caption="Bulldozer is on site daily; doesn't gate soil throughput."
+    )
+    n_bulldozer     = bull['n']
+    bulldozer_daily = bull['unit_daily']
+    
+    skid = _equipment_inputs(
+        "Skidsteer (on site, not in soil processing)",
+        key_prefix='skidsteer',
+        default_units=1, default_equip_rate=200.0, default_op_rate=100.0,
+        units_min=0
+    )
+    n_skidsteer     = skid['n']
+    skidsteer_daily = skid['unit_daily']
     
     # Derived daily soil-movement capacity (bottleneck of excavator vs loader fleet)
     excavator_fleet_capacity = n_excavator * excavator_capacity
@@ -1335,22 +1547,51 @@ def main():
                                                   help="Lump cost per CY; mixture breakdown coming later")
         st.caption("Charged on first Treat day of each flip")
     
-    # Workday hours (used for trucks-required display only)
-    workday_hours = 8.0  # informational; doesn't affect cost
-    
     # Build cost params dict
     cost_params = {
-        # Equipment fleet
+        # Equipment fleet — combined daily-equivalent costs (equip + operator if not self-operating)
         'n_excavator': n_excavator,
         'excavator_capacity': excavator_capacity,
         'excavator_daily': excavator_daily,
+        'excavator_equip_rate':   exc['equip_rate'],
+        'excavator_equip_period': exc['equip_period'],
+        'excavator_op_rate':      exc['op_rate'],
+        'excavator_op_period':    exc['op_period'],
+        'excavator_self_op':      exc['self_operated'],
+        'excavator_equip_daily':  exc['equip_daily'],
+        'excavator_op_daily':     exc['op_daily'],
+        
         'n_loader': n_loader,
         'loader_capacity': loader_capacity,
         'loader_daily': loader_daily,
+        'loader_equip_rate':   load['equip_rate'],
+        'loader_equip_period': load['equip_period'],
+        'loader_op_rate':      load['op_rate'],
+        'loader_op_period':    load['op_period'],
+        'loader_self_op':      load['self_operated'],
+        'loader_equip_daily':  load['equip_daily'],
+        'loader_op_daily':     load['op_daily'],
+        
         'n_bulldozer': n_bulldozer,
         'bulldozer_daily': bulldozer_daily,
+        'bulldozer_equip_rate':   bull['equip_rate'],
+        'bulldozer_equip_period': bull['equip_period'],
+        'bulldozer_op_rate':      bull['op_rate'],
+        'bulldozer_op_period':    bull['op_period'],
+        'bulldozer_self_op':      bull['self_operated'],
+        'bulldozer_equip_daily':  bull['equip_daily'],
+        'bulldozer_op_daily':     bull['op_daily'],
+        
         'n_skidsteer': n_skidsteer,
         'skidsteer_daily': skidsteer_daily,
+        'skidsteer_equip_rate':   skid['equip_rate'],
+        'skidsteer_equip_period': skid['equip_period'],
+        'skidsteer_op_rate':      skid['op_rate'],
+        'skidsteer_op_period':    skid['op_period'],
+        'skidsteer_self_op':      skid['self_operated'],
+        'skidsteer_equip_daily':  skid['equip_daily'],
+        'skidsteer_op_daily':     skid['op_daily'],
+        
         'effective_daily_capacity': effective_daily_capacity,
         'bottleneck': bottleneck,
         # Water
